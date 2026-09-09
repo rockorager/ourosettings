@@ -2,19 +2,22 @@ interface dev.rockorager.ouro.Settings
 
 type RGB (r: float, g: float, b: float)
 type OutputMatch (name: ?string, connector_id: ?int, connector_type: ?int, connector_type_id: ?int, width_mm: ?int, height_mm: ?int)
-type Mode (width: int, height: int, refresh_millihertz: ?int)
-type Position (x: int, y: int)
-type OutputSettings (enabled: ?bool, mode: ?Mode, position: ?Position, scale: ?float, icc_profile: ?string)
-type OutputRule (name: string, priority: int, match: OutputMatch, settings: OutputSettings)
 type Appearance (color_scheme: (default, light, dark), accent: ?RGB)
 type Wallpaper (image: ?string, fit: (fill, fit, stretch, center, tile), fallback: RGB)
 type OutputWallpaper (match: OutputMatch, wallpaper: Wallpaper)
 type Wallpapers (default: Wallpaper, outputs: []OutputWallpaper)
-type Keybinding (trigger: string, action: []string, repeat: ?bool)
-type Settings (appearance: Appearance, outputs: []OutputRule, preferred_output: ?OutputMatch, wallpaper: Wallpapers, keybindings: []Keybinding)
+# Compositor is Ouro config JSON: general, bindings, input_rules, output_rules.
+# Preserve omitted members, null deletions, default resets and dynamic names.
+# Ouro, not this store, validates/applies the contents of these four members.
+type Settings (appearance: Appearance, compositor: object, preferred_output: ?OutputMatch, wallpaper: Wallpapers)
+type Section (appearance, compositor, preferred_output, wallpaper)
 
 method Get() -> (revision: string, settings: Settings)
 method Set(expected_revision: string, settings: Settings) -> (revision: string, settings: Settings)
+# Replace one complete section, never merge. Required value except for
+# preferred_output: omitted/null clears it. Other sections reject omitted/null.
+# Uses the same global revision and Watch stream as Set; no-ops do not publish.
+method SetSection(expected_revision: string, section: Section, value: ?object) -> (revision: string, settings: Settings)
 method Watch() -> (revision: string, settings: Settings)
 
 error Conflict(revision: string)

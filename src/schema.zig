@@ -25,7 +25,8 @@ pub const Wallpaper = struct {
     fit: enum { fill, fit, stretch, center, tile },
     fallback: RGB,
 };
-pub const Settings = struct {
+// Version 1 types remain only to validate and migrate existing state.
+pub const LegacySettings = struct {
     appearance: struct { color_scheme: enum { default, light, dark }, accent: ?RGB = null },
     outputs: []const OutputRule,
     preferred_output: ?OutputMatch = null,
@@ -35,12 +36,19 @@ pub const Settings = struct {
     },
     keybindings: []const struct { trigger: []const u8, action: []const []const u8, repeat: ?bool = null },
 };
+pub const Settings = struct {
+    appearance: @FieldType(LegacySettings, "appearance"),
+    compositor: std.json.Value,
+    preferred_output: ?OutputMatch = null,
+    wallpaper: @FieldType(LegacySettings, "wallpaper"),
+};
+pub const Section = enum { appearance, compositor, preferred_output, wallpaper };
 pub const State = struct { version: u32, revision: []const u8, settings: Settings };
+pub const LegacyState = struct { version: u32, revision: []const u8, settings: LegacySettings };
 pub const defaults: Settings = .{
     .appearance = .{ .color_scheme = .default },
-    .outputs = &.{},
+    .compositor = .{ .object = .empty },
     .wallpaper = .{ .default = .{ .fit = .fill, .fallback = .{ .r = 0, .g = 0, .b = 0 } }, .outputs = &.{} },
-    .keybindings = &.{},
 };
 
 fn valid(ok: bool) !void {
@@ -61,6 +69,18 @@ fn wallpaper(w: Wallpaper) !void {
     if (w.image) |s| try valid(text(s) and s[0] == '/');
 }
 pub fn validate(s: Settings) !void {
+    // Ouro owns the contents, including action/device validation and merge
+    // patch semantics. Do not turn null deletions into omitted preferences.
+    try valid(s.compositor == .object);
+    var it = s.compositor.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        try valid(std.mem.eql(u8, key, "general") or std.mem.eql(u8, key, "bindings") or std.mem.eql(u8, key, "input_rules") or std.mem.eql(u8, key, "output_rules"));
+        try valid(entry.value_ptr.* == .object or entry.value_ptr.* == .null);
+    }
+    try validateLegacy(.{ .appearance = s.appearance, .outputs = &.{}, .preferred_output = s.preferred_output, .wallpaper = s.wallpaper, .keybindings = &.{} });
+}
+pub fn validateLegacy(s: LegacySettings) !void {
     if (s.appearance.accent) |v| try rgb(v);
     if (s.preferred_output) |v| try selector(v);
     for (s.outputs, 0..) |rule, i| {
@@ -114,12 +134,11 @@ fn trigger(s: []const u8) !struct { mods: u4, key: []const u8 } {
     return .{ .mods = mods, .key = part };
 }
 
-test "finite color, scale and normalized trigger ambiguity" {
+test "finite color and legacy normalized trigger ambiguity" {
     var s = defaults;
     s.appearance.accent = .{ .r = std.math.nan(f64), .g = 0, .b = 1 };
     try std.testing.expectError(error.InvalidSettings, validate(s));
-    s = defaults;
-    s.keybindings = &.{ .{ .trigger = "Ctrl+Logo+q", .action = &.{"close"} }, .{ .trigger = "Super+Control+Q", .action = &.{"exit"} } };
-    try std.testing.expectError(error.InvalidSettings, validate(s));
+    const legacy: LegacySettings = .{ .appearance = defaults.appearance, .outputs = &.{}, .wallpaper = defaults.wallpaper, .keybindings = &.{ .{ .trigger = "Ctrl+Logo+q", .action = &.{"close"} }, .{ .trigger = "Super+Control+Q", .action = &.{"exit"} } } };
+    try std.testing.expectError(error.InvalidSettings, validateLegacy(legacy));
     try validate(defaults);
 }

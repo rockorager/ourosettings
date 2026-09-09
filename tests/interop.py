@@ -30,10 +30,17 @@ with tempfile.TemporaryDirectory(prefix="ourosettings-interop-") as temp:
                 assert new["settings"] == example
                 assert new["revision"] != old["revision"]
                 assert settings.Get() == new
+                updated = settings.SetSection(expected_revision=new["revision"], section="appearance", value={"color_scheme": "dark"})
+                assert updated["settings"]["appearance"] == {"color_scheme": "dark"}
+                assert updated["settings"]["compositor"] == example["compositor"]
+                assert updated["settings"]["wallpaper"] == example["wallpaper"]
+                assert updated["revision"] != new["revision"]
+                new = settings.SetSection(expected_revision=updated["revision"], section="preferred_output", value=None)
+                assert "preferred_output" not in new["settings"] or new["settings"]["preferred_output"] is None
             with client.open(interface) as settings:
                 stream = settings.Watch(_more=True)
                 assert next(stream) == new
-        print("Independent Varlink client: discovery, Get, Set, Watch passed")
+        print("Independent Varlink client: discovery, Get, Set, SetSection, Watch passed")
     finally:
         process.terminate()
         assert process.wait(timeout=3) == 0

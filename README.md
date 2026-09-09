@@ -9,8 +9,9 @@ package dependencies beyond libc.
 Varlink client. This daemon never writes that config or signals Ouro. A future
 compositor consumer must apply desired preferences and own/report live state.
 Successful persistence does not prove that a key, action, image, ICC profile,
-device, or mode works. No migration or merge with existing Ouro configuration is
-performed. Input rules and general/layout settings are deferred.
+device, or mode works. No import or merge with Ouro's existing configuration
+files is performed. General/layout settings, bindings, input rules and output
+rules belong together under `settings.compositor`, in Ouro's own JSON format.
 
 Native control uses Varlink (`dev.rockorager.ouro.Settings`). D-Bus/portal
 translation belongs in the separate ourobridge; Wayland and PipeWire remain
@@ -65,6 +66,16 @@ All replies contain `parameters`, including `{}` for parameterless errors.
   Validation and persistence precede publication. A mismatched token returns
   `dev.rockorager.ouro.Settings.Conflict` with the current `revision`; refetch and
   deliberately merge/retry, rather than blindly replaying a stale replacement.
+* **SetSection** takes `{expected_revision, section, value}` and replaces exactly
+  one of `appearance`, `compositor`, `wallpaper`, or `preferred_output`. It uses
+  the same global revision as Set, even for writers editing different sections.
+  Every unrelated preference is retained. `value` must be the complete section
+  object, not a merge patch: omitted optional fields inside it are cleared.
+  Only `preferred_output` permits omitted/null `value`, clearing that preference;
+  `{}` instead stores an all-output selector. Other sections require an object.
+  It returns the same complete snapshot as Set and shares its validation,
+  no-op, conflict, persistence and Watch behavior. On conflict, refetch and
+  reconsider the section replacement; unrelated writes also invalidate a token.
 * **Watch** requires `more: true` (otherwise standard `ExpectedMore`). It sends
   the current complete snapshot immediately and each later committed snapshot,
   all with `continues: true`. Subscribe directly: a preceding Get is unnecessary.
@@ -76,11 +87,15 @@ Revisions are opaque, random 128-bit lowercase hex tokens, persisted with state.
 They survive restart and differ after state recreation; they are not counters
 or authorization secrets. Restoring an old backup restores its token: offline
 restoration must be treated as a new administrative session, with clients
-reconnected. A no-op is equality of the typed serialized snapshot (optional
+reconnected. A no-op is equality of the serialized snapshot (desktop optional
 nulls omitted, object key order normalized, array order retained): it preserves
 revision, performs no write, and emits no notification. Explicit `repeat: false`
 and unspecified repeat remain distinct stored preferences, though both mean no
-repeat to a consumer. External edits are checked before even a no-op Set.
+repeat in a final Ouro binding. Within `compositor`, nulls, omitted members,
+shorthand/object bindings and number lexemes are preserved: `1`, `1.0` and `1e0`
+are distinct because Ouro rejects non-integer tokens in integer fields. JSON
+whitespace, string escaping and object order are not preserved. External edits
+are checked before even a no-op Set or SetSection.
 
 With systemd's `varlinkctl` installed (255+ for basic calls, 257+ for the infinite
 Watch timeout), replace `address` for an isolated instance if desired:
@@ -92,51 +107,42 @@ varlinkctl info "$address"
 varlinkctl introspect "$address" "$interface"
 varlinkctl call "$address" "$interface.Get" '{}'
 
-# Read, change one preference locally, then replace using the read token.
+# Read the token and replace appearance without resubmitting compositor data.
 # jq is only an example client tool, not a daemon dependency.
 snapshot=$(varlinkctl call "$address" "$interface.Get" '{}')
 printf '%s' "$snapshot" | jq '{expected_revision: .revision,
-  settings: (.settings | .appearance.color_scheme = "dark")}' |
-  varlinkctl call "$address" "$interface.Set"
+  section: "appearance", value: (.settings.appearance | .color_scheme = "dark")}' |
+  varlinkctl call "$address" "$interface.SetSection"
 
 varlinkctl --more --timeout=infinity call "$address" "$interface.Watch" '{}'
 varlinkctl validate-idl protocol/dev.rockorager.ouro.Settings.varlink
 ```
 
-## Version 1 schema and validation boundary
+## Version 2 schema and validation boundary
 
 `examples/settings.json` illustrates the persisted envelope
-`{version: 1, revision, settings}`. Its token and paths are illustrative, not a
+`{version: 2, revision, settings}`. Its token and paths are illustrative, not a
 file to copy over a running daemon. Use only its `settings` object in a Set,
 with a fresh revision from Get. Initial defaults: default color scheme, no
-accent/output rules/preferred output/keybindings, black fallback wallpaper with
-fill fit and no image/per-output entries.
+accent/preferred output, black fallback wallpaper with fill fit and no
+image/per-output entries, and `compositor: {}`. No compositor defaults are
+invented or copied into this daemon.
 
-All top-level settings sections and their non-optional fields are required.
-Unknown fields and duplicate JSON keys (at every depth) are rejected, not
-silently ignored. Optional fields may be absent or null, meaning unspecified;
-responses omit them. Required fields do not accept null. Numeric strings and
-non-integer JSON tokens in integer fields (including `1.0` and `1e0`) are
-rejected. Arrays are replacements, not merge patches.
+`appearance`, `compositor`, and `wallpaper` are required; `preferred_output` is
+optional. Unknown fields in daemon-owned typed structures and duplicate JSON
+keys at every depth are rejected. Desktop optional fields may be absent or
+null, meaning unspecified; responses omit them. Required fields reject null.
+Numeric strings and non-integer tokens in desktop integer fields (including
+`1.0` and `1e0`) are rejected. Arrays are replacements, not merge patches.
 
 * **Appearance:** `color_scheme` is `default`, `light`, or `dark`; optional RGB
   accent has required finite `r`, `g`, `b` components in [0, 1].
-* **Outputs:** `outputs` is an array of `{name, priority, match, settings}`.
-  Rule names must be nonempty and unique; priority is i32. The schema preserves
-  Ouro's rule identity, not a new make/model/serial/connector identity system.
-  Consumers apply all matching rules sorted by ascending `(priority, name)`,
-  later specified fields winning. Array order is stored but is not precedence.
+* **Preferred output:** a separate desktop-wide OutputMatch preference, not a
+  live connected/primary-output result and not duplicated under `compositor`.
   OutputMatch fields are conjunctive: optional byte-glob `name` (`*`/`?`, e.g.
   `DRM-*`), u32 `connector_id`, `connector_type`, `connector_type_id`, `width_mm`,
-  `height_mm`. `{}` matches all outputs. Overlap between different rules is
-  intentional and allowed. `enabled`, `mode`, `position`, `scale`, `icc_profile`
-  are optional. Mode requires positive u32 width/height, optional u32 refresh
-  in millihertz (0 is not rejected here). Position uses i32 x/y. Scale must be
-  finite and positive; compositor scale quantization and representability are
-  consumer responsibilities. ICC profile is an absolute, NUL-free path; no
-  profile is loaded. `preferred_output` is a separate optional OutputMatch,
-  not a live connected/primary-output result. Selection among multiple matches
-  is a compositor decision.
+  `height_mm`. `{}` matches all outputs. Selection among multiple matches is a
+  consumer decision.
 * **Wallpaper:** required `default` preference and `outputs` array of
   `{match, wallpaper}` entries. Matching uses OutputMatch above. Per-output
   entries replace the whole wallpaper preference; if several match, the last
@@ -149,20 +155,77 @@ rejected. Arrays are replacements, not merge patches.
   image/profile paths occur. No image means fallback-only; a consumer also uses
   fallback when it cannot render an image. Fit modes mean aspect-preserving
   cover/contain, nonuniform stretch, native-size center, or native-size tiling.
-* **Keybindings:** array of `{trigger, action, repeat?}`. Action is a nonempty
-  string argv array using Ouro's JSON vocabulary, e.g. `["run", "foot"]` or
-  `["close"]`; first argument nonempty, all arguments NUL-free. No shell or
-  command execution occurs. Modifier syntax follows Ouro (`shift`,
-  `control`/`ctrl`, `alt`, `super`/`logo`/`mod4`), case-insensitive. Duplicate
-  modifiers and equivalent modifier-order/alias plus case-folded key strings
-  are rejected. XKB keysym resolution/aliases, action vocabulary/arity,
-  executable validity, and actual binding conflicts remain compositor checks.
-  Unspecified repeat means false. This is not the compositor's built-in binding
-  baseline and does not implicitly migrate or clear its existing bindings.
+* **Compositor:** a standard Varlink `object`, not a JSON-encoded string or a
+  daemon-specific action/rule schema. The daemon requires an object whose only
+  members are `general`, `bindings`, `input_rules`, and `output_rules`, each
+  either an object or null. Their contents remain raw JSON, including unknown
+  nested fields, partial rules/bindings, numbers and nulls. The daemon does not
+  claim these contents pass Ouro validation. Ouro owns field types/ranges,
+  triggers/XKB, action vocabulary/arity, rule matching, hardware support, scale
+  quantization, and ICC loading/application. This boundary avoids a second
+  incompatible schema and supports input reset unions and dynamic keys without
+  normalizing away their meaning. Desktop sections remain typed in the IDL;
+  `SetSection.value` is `?object` because its type depends on `section`.
+
+Authoritative config contract inspected in upstream Ouro
+[`1394e361`](https://github.com/rockorager/ouro/commit/1394e361993e100775d680ef9585fe9a1a7ce4ce),
+`src/config.zig` (parser and tests) and `src/runtime/settings.zig`:
+
+* `general` contains `focus_follows_mouse`, `inner_gap`, `outer_gap`.
+* `bindings` maps exact trigger strings to action argv arrays or
+  `{action: [...], repeat?: bool}`. Argument order, case and empty arguments
+  remain intact. No actions are executed here.
+* `input_rules` and `output_rules` are **objects keyed by rule name**, not
+  arrays. Rules carry optional `priority`, `match`, `settings`. Ouro applies
+  matching rules in ascending `(priority, name)` order, with later specified
+  settings winning. JSON object order is irrelevant; names and priorities are
+  retained. Output settings include enabled/mode/position/scale/ICC preferences;
+  input settings include device toggles, acceleration, scrolling and repeat.
+* Ouro layers config sources using RFC 7396 over its built-in defaults. An
+  omitted member leaves the underlying value alone; null deletes that member.
+  `bindings: null` clears the binding class; `bindings: {}` does not clear
+  built-in bindings. Null nested members remove overrides. Input `"default"`
+  explicitly resets to a device/software default and is distinct from absent
+  or null, which contributes no override to rule resolution. General and input
+  omissions leave Ouro's own default behavior in charge.
+
+The stored `compositor` is one desired Ouro-format configuration source, not
+resolved live state. Set/SetSection replace that entire stored source; they do
+**not** apply RFC 7396 to the previous stored source. Future consumers must
+define how this source participates in Ouro's configuration layering; none is
+implemented here. A partial source can be valid only in combination with other
+sources, so persistence cannot guarantee final compositor validity.
+
+## Version 1 migration is atomic and fail-closed
+
+Startup automatically validates version 1 using its original strict schema,
+then converts `outputs` to `compositor.output_rules` keyed by each rule's name,
+and `keybindings` to `compositor.bindings` keyed by each exact trigger. Priority,
+match/settings, argv order and optional repeat are retained. Array order was
+not rule precedence in version 1; `(priority, name)` still determines it.
+Appearance, preferred output and wallpaper remain unchanged (legacy optional
+nulls still mean absent). General and input rules remain absent. Empty legacy
+collections become empty objects, not null class deletions; migration neither
+imports nor clears Ouro's existing configuration.
+
+The converted envelope is version 2 with a **fresh global revision**, atomically
+persisted before any requests or initial Watch snapshot are served. Old tokens
+cannot overwrite migrated preferences; clients must refetch and use the new
+schema. Version 2 retains its revision on subsequent restarts. Migration is
+one-way; back up the stopped daemon's file before upgrading if rollback is
+needed. The old executable will refuse version 2 rather than downgrade it.
+
+Invalid revisions, duplicate/ambiguous legacy names or triggers, unknown fields,
+malformed JSON, unsupported versions or an oversized result abort startup
+without rewriting the original file. Pre-rename migration write/fsync/rename
+failures also leave the original intact. Post-rename directory-fsync failure
+has the same ambiguous-commit behavior described below; restart and inspect.
+No best-effort dropping of unsupported data and no repair of unsafe files occurs.
 
 ## Transport, persistence, and failure semantics
 
-Native Linux AF_UNIX stream, bounded NUL-terminated UTF-8 JSON. Same-effective-UID
+Native Linux AF_UNIX stream, bounded NUL-terminated UTF-8 JSON (maximum nesting
+depth 64 from the request/envelope root). Same-effective-UID
 `SO_PEERCRED` is checked on each accepted connection; other UIDs receive standard
 `PermissionDenied` best-effort before disconnect. Private socket mode is 0600.
 **This is UID isolation, not sandbox/app authorization.** A process with the same
@@ -239,7 +302,9 @@ uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings
 ```
 
 Integration tests start the actual executable on isolated Unix sockets, not mock
-services. They cover stale writes, snapshots/no-ops/restart/reset, corruption
+services. They cover Ouro config examples, null/default/omission and argv
+preservation, rule names/priorities, atomic section replacement, v1 migration
+and no-clobber failures, stale writes, snapshots/no-ops/restart/reset, corruption
 retention, field bounds/duplicate keys/nulls, framing/pipelining, slow readers,
 client limits, 30-second partial-request timeout, inherited listener validation,
 idle/reactivation, private permissions, locks, and safe socket cleanup. A test-only
@@ -249,28 +314,30 @@ exercise actual write failures. No fault hooks exist in the daemon. Foreign-UID
 and owner tests use passwordless sudo solely for temporary fixtures; these two
 tests skip when unavailable. No real systemd manager or compositor is required.
 
-Verified in the initial Linux x86_64 orb on 2026-09-09, as an unprivileged user:
+Verified for version 2 in this Linux x86_64 orb on 2026-09-09, as an
+unprivileged user with Zig 0.16.0:
 
 | Command | Result |
 | --- | --- |
 | `zig fmt --check build.zig build.zig.zon src` | exit 0, no formatting changes |
 | `zig build --summary all` | 3/3 steps succeeded (Debug) |
-| `zig build test --summary all` | 5/5 steps; 2/2 Zig tests; 18 integration tests, OK, 33.397s |
+| `zig build test --summary all` | 5/5 steps; 2/2 Zig tests; 23 integration tests, OK, 34.459s |
 | `zig build -Doptimize=ReleaseSafe --prefix zig-out/ReleaseSafe --summary all` | 3/3 steps succeeded |
-| `zig build test -Doptimize=ReleaseSafe --summary all` | 5/5 steps; 2/2 Zig tests; 18 integration tests, OK, 32.910s |
+| `zig build test -Doptimize=ReleaseSafe --summary all` | 5/5 steps; 2/2 Zig tests; 23 integration tests, OK, 33.994s |
 | `zig build -Doptimize=ReleaseFast --prefix zig-out/ReleaseFast --summary all` | 3/3 steps succeeded |
-| `zig build test -Doptimize=ReleaseFast --summary all` | 5/5 steps; 2/2 Zig tests; 18 integration tests, OK, 32.871s |
-| `uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings` | both IDLs parsed; independent client discovery/Get/Set/Watch passed |
-| `bash -n .agents/setup`, setup twice, fresh login shell `zig version` | success; cold 10.989s, warm 0.056s; version 0.16.0 |
+| `zig build test -Doptimize=ReleaseFast --summary all` | 5/5 steps; 2/2 Zig tests; 23 integration tests, OK, 33.934s |
+| `uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings` | both IDLs parsed; independent client discovery/Get/Set/SetSection/Watch passed |
 
 No tests skipped in this orb. `varlinkctl` was unavailable; its documented
 commands were not executed, and the independent Python parser/client was used
-instead. `systemd-analyze verify systemd/ourosettings.socket
-systemd/ourosettings.service` reported only
-`Command /usr/local/bin/ourosettings is not executable: No such file or directory`
-(exit 1); the executable and units were deliberately not installed. Activation
-was tested with a real inherited listener, not a running systemd user manager.
-No compositor integration or physical power-loss test was performed.
+instead. An initial ReleaseSafe run exposed a pre-existing slow-reader test
+race: a write can disconnect a Watch before its initial snapshot is flushed.
+The test now consumes and checks the initial snapshot before withholding reads,
+then checks ordered committed snapshots and eventual backpressure disconnect.
+All three full suites above passed after that correction. Activation was tested
+with a real inherited listener, not a running systemd user manager. No services
+were installed/enabled, and no compositor integration, live desktop mutation or
+physical power-loss test was performed.
 
 References: [ouroshot](https://github.com/rockorager/ouroshot) Linux activation,
 peer credentials, and framing; [Ouro](https://github.com/rockorager/ouro)

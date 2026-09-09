@@ -1,18 +1,29 @@
 {
-  "version": 1,
+  "version": 2,
   "revision": "e2d1c0b9a8f76543210abcdef123456789",
   "settings": {
     "appearance": {"color_scheme": "light", "accent": {"r": 0.2, "g": 0.4, "b": 0.8}},
-    "outputs": [
-      {"name": "desk", "priority": 10, "match": {"name": "DRM-*", "connector_id": 42},
-       "settings": {"enabled": true, "mode": {"width": 2560, "height": 1440, "refresh_millihertz": 59950},
-                    "position": {"x": -2560, "y": 120}, "scale": 1.25, "icc_profile": "/home/example/profiles/desk.icc"}}
-    ],
+    "compositor": {
+      "general": {"focus_follows_mouse": true, "inner_gap": 4, "outer_gap": 8},
+      "bindings": {
+        "Super+Return": ["run", "foot", "--app-id=terminal"],
+        "super+h": {"action": ["focus-left"], "repeat": true},
+        "super+q": null
+      },
+      "input_rules": {
+        "touchpad": {"match": {"type": "touchpad"}, "settings": {"tap": true, "natural_scroll": "default", "accel_speed": -0.25}},
+        "keyboard": {"settings": {"repeat_rate": 30, "repeat_delay": "default"}}
+      },
+      "output_rules": {
+        "desk": {"priority": 10, "match": {"name": "DRM-*", "connector_id": 42},
+          "settings": {"enabled": true, "mode": {"width": 2560, "height": 1440, "refresh_millihertz": 59950},
+                       "position": {"x": -2560, "y": 120}, "scale": 1.25, "icc_profile": "/home/example/profiles/desk.icc"}}
+      }
+    },
     "preferred_output": {"connector_id": 42},
     "wallpaper": {
       "default": {"image": "/home/example/Pictures/wallpaper.png", "fit": "fill", "fallback": {"r": 0.1, "g": 0.15, "b": 0.2}},
       "outputs": [{"match": {"connector_id": 42}, "wallpaper": {"fit": "center", "fallback": {"r": 0, "g": 0, "b": 0}}}]
-    },
-    "keybindings": [{"trigger": "Super+Return", "action": ["run", "foot", "--app-id=terminal"], "repeat": false}]
+    }
   }
 }

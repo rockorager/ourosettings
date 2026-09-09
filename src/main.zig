@@ -56,8 +56,9 @@ const Service = struct {
     clients: [32]Connection = @splat(.{}),
 
     fn request(self: *Service, client: *Connection, bytes: []const u8) !void {
-        const parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch return client.invalid("request");
+        var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch return client.invalid("request");
         defer parsed.deinit();
+        storage.normalize(&parsed.value, 0) catch return client.invalid("request");
         if (parsed.value != .object) return client.invalid("request");
         const obj = parsed.value.object;
         var it = obj.iterator();
@@ -86,14 +87,33 @@ const Service = struct {
             client.watching = watch;
             return client.snapshot(self.store);
         }
-        if (std.mem.eql(u8, method, interface ++ ".Set")) {
-            const Set = struct { expected_revision: []const u8, settings: schema.Settings };
-            storage.shape(Set, params) catch return client.invalid("parameters");
-            const value = std.json.parseFromValue(Set, a, params, .{}) catch return client.invalid("settings");
-            defer value.deinit();
-            schema.validate(value.value.settings) catch return client.invalid("settings");
-            if (!std.mem.eql(u8, value.value.expected_revision, self.store.state.value.revision)) return client.failure(interface ++ ".Conflict", .{ .revision = self.store.state.value.revision });
-            const changed = self.store.set(value.value.settings) catch |err| switch (err) {
+        const section_write = std.mem.eql(u8, method, interface ++ ".SetSection");
+        if (std.mem.eql(u8, method, interface ++ ".Set") or section_write) {
+            var settings = self.store.state.value.settings;
+            const allocator = parsed.arena.allocator();
+            const expected_revision = if (section_write) blk: {
+                const SetSection = struct { expected_revision: []const u8, section: schema.Section, value: ?std.json.Value = null };
+                storage.shape(SetSection, params) catch return client.invalid("parameters");
+                const update = std.json.parseFromValueLeaky(SetSection, allocator, params, .{}) catch return client.invalid("section");
+                const value = update.value orelse std.json.Value.null;
+                switch (update.section) {
+                    inline else => |section| {
+                        const T = @FieldType(schema.Settings, @tagName(section));
+                        storage.shape(T, value) catch return client.invalid("value");
+                        @field(settings, @tagName(section)) = std.json.parseFromValueLeaky(T, allocator, value, .{}) catch return client.invalid("value");
+                    },
+                }
+                break :blk update.expected_revision;
+            } else blk: {
+                const Set = struct { expected_revision: []const u8, settings: schema.Settings };
+                storage.shape(Set, params) catch return client.invalid("parameters");
+                const value = std.json.parseFromValueLeaky(Set, allocator, params, .{}) catch return client.invalid("settings");
+                settings = value.settings;
+                break :blk value.expected_revision;
+            };
+            schema.validate(settings) catch return client.invalid("settings");
+            if (!std.mem.eql(u8, expected_revision, self.store.state.value.revision)) return client.failure(interface ++ ".Conflict", .{ .revision = self.store.state.value.revision });
+            const changed = self.store.set(settings) catch |err| switch (err) {
                 error.AmbiguousCommit => return err,
                 error.StateTooLarge => return client.invalid("settings"),
                 else => return client.failure(interface ++ ".PersistenceFailed", struct {}{}),

@@ -6,8 +6,33 @@ const schema = @import("schema.zig");
 pub const state_limit = 128 * 1024;
 pub const json_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
 
+// Bound recursive processing and canonicalize objects, never arrays or nulls.
+// Number lexemes are retained in raw compositor JSON: 1, 1.0 and 1e0 can have
+// different validity in Ouro's integer fields and must not be conflated.
+pub fn normalize(v: *std.json.Value, depth: usize) !void {
+    if (depth > 64) return error.TooDeep;
+    switch (v.*) {
+        .object => |*object| {
+            for (object.values()) |*child| try normalize(child, depth + 1);
+            const Order = struct {
+                keys: []const []const u8,
+                pub fn lessThan(self: @This(), x: usize, y: usize) bool {
+                    return std.mem.lessThan(u8, self.keys[x], self.keys[y]);
+                }
+            };
+            object.sort(Order{ .keys = object.keys() });
+        },
+        .array => |*array| for (array.items) |*child| try normalize(child, depth + 1),
+        else => {},
+    }
+}
+
 // std.json's typed parser accepts numeric strings. The wire contract does not.
 pub fn shape(comptime T: type, v: std.json.Value) !void {
+    if (T == std.json.Value) {
+        if (v != .object) return error.InvalidShape;
+        return;
+    }
     switch (@typeInfo(T)) {
         .optional => |o| if (v != .null) {
             try shape(o.child, v);
@@ -37,18 +62,58 @@ pub fn shape(comptime T: type, v: std.json.Value) !void {
                 for (v.array.items) |item| try shape(p.child, item);
             }
         },
-        .int => if (v != .integer) return error.InvalidShape,
-        .float => if (v != .integer and v != .float) return error.InvalidShape,
+        .int => if (v != .integer and (v != .number_string or !std.json.isNumberFormattedLikeAnInteger(v.number_string))) return error.InvalidShape,
+        .float => if (v != .integer and v != .float and v != .number_string) return error.InvalidShape,
         .bool => if (v != .bool) return error.InvalidShape,
         .@"enum" => if (v != .string) return error.InvalidShape,
         else => @compileError("unsupported schema type"),
     }
 }
 pub fn parse(comptime T: type, bytes: []const u8) !std.json.Parsed(T) {
-    const value = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = state_limit * 2 });
-    defer value.deinit();
+    var value = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .max_value_len = state_limit * 2, .parse_numbers = false, .allocate = .alloc_always });
+    errdefer value.deinit();
+    try normalize(&value.value, 0);
     try shape(T, value.value);
-    return std.json.parseFromValue(T, a, value.value, .{ .allocate = .alloc_always });
+    // Value.jsonParseFromValue borrows its source; retain the source arena.
+    return .{ .arena = value.arena, .value = try std.json.parseFromValueLeaky(T, value.arena.allocator(), value.value, .{}) };
+}
+
+fn revisionValid(revision: []const u8) !void {
+    if (revision.len != 32) return error.InvalidRevision;
+    for (revision) |ch| if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return error.InvalidRevision;
+}
+
+fn toValue(allocator: std.mem.Allocator, value: anytype) !std.json.Value {
+    const bytes = try std.json.Stringify.valueAlloc(allocator, value, json_options);
+    return std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{ .parse_numbers = false });
+}
+
+fn migrate(bytes: []const u8) ![]u8 {
+    const old = try parse(schema.LegacyState, bytes);
+    defer old.deinit();
+    if (old.value.version != 1) return error.UnknownVersion;
+    try revisionValid(old.value.revision);
+    try schema.validateLegacy(old.value.settings);
+    const allocator = old.arena.allocator();
+    var outputs: std.json.Value = .{ .object = .empty };
+    for (old.value.settings.outputs) |rule| {
+        try outputs.object.put(allocator, rule.name, try toValue(allocator, .{ .priority = rule.priority, .match = rule.match, .settings = rule.settings }));
+    }
+    var bindings: std.json.Value = .{ .object = .empty };
+    for (old.value.settings.keybindings) |binding| {
+        try bindings.object.put(allocator, binding.trigger, try toValue(allocator, .{ .action = binding.action, .repeat = binding.repeat }));
+    }
+    var compositor: std.json.Value = .{ .object = .empty };
+    try compositor.object.put(allocator, "output_rules", outputs);
+    try compositor.object.put(allocator, "bindings", bindings);
+    try normalize(&compositor, 0);
+    const revision = try os.token();
+    return std.json.Stringify.valueAlloc(a, schema.State{ .version = 2, .revision = &revision, .settings = .{
+        .appearance = old.value.settings.appearance,
+        .preferred_output = old.value.settings.preferred_output,
+        .wallpaper = old.value.settings.wallpaper,
+        .compositor = compositor,
+    } }, json_options);
 }
 pub const Store = struct {
     dir: c_int,
@@ -67,20 +132,34 @@ pub const Store = struct {
         const lock_fd = try os.lock(dir, lock_name);
         errdefer _ = c.close(lock_fd);
         const existing = try read(dir, name);
-        const disk = existing orelse blk: {
+        var disk = existing orelse blk: {
             const revision = try os.token();
-            const bytes = try std.json.Stringify.valueAlloc(a, schema.State{ .version = 1, .revision = &revision, .settings = schema.defaults }, json_options);
+            const bytes = try std.json.Stringify.valueAlloc(a, schema.State{ .version = 2, .revision = &revision, .settings = schema.defaults }, json_options);
             errdefer a.free(bytes);
             try persist(dir, name, bytes);
             break :blk bytes;
         };
         errdefer a.free(disk);
+        // Inspect the version before choosing a schema; never rewrite an
+        // unknown/corrupt state or partially migrate an unsupported v1 value.
+        const header = try std.json.parseFromSlice(std.json.Value, a, disk, .{ .duplicate_field_behavior = .@"error" });
+        defer header.deinit();
+        if (header.value != .object) return error.InvalidShape;
+        const version = header.value.object.get("version") orelse return error.UnknownVersion;
+        if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.UnknownVersion;
+        const migrating = version.integer == 1;
+        if (migrating) {
+            const bytes = try migrate(disk);
+            a.free(disk);
+            disk = bytes;
+        }
+        if (disk.len > state_limit) return error.StateTooLarge;
         const state = try parse(schema.State, disk);
         errdefer state.deinit();
-        if (state.value.version != 1) return error.UnknownVersion;
-        if (state.value.revision.len != 32) return error.InvalidRevision;
-        for (state.value.revision) |ch| if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return error.InvalidRevision;
+        if (state.value.version != 2) return error.UnknownVersion;
+        try revisionValid(state.value.revision);
         try schema.validate(state.value.settings);
+        if (migrating) try persist(dir, name, disk);
         return .{ .dir = dir, .lock_fd = lock_fd, .name = name, .disk = disk, .state = state };
     }
     pub fn deinit(self: *Store) void {
@@ -102,7 +181,7 @@ pub const Store = struct {
         defer a.free(new);
         if (std.mem.eql(u8, old, new)) return false;
         const revision = try os.token();
-        const bytes = try std.json.Stringify.valueAlloc(a, schema.State{ .version = 1, .revision = &revision, .settings = settings }, json_options);
+        const bytes = try std.json.Stringify.valueAlloc(a, schema.State{ .version = 2, .revision = &revision, .settings = settings }, json_options);
         errdefer a.free(bytes);
         if (bytes.len > state_limit) return error.StateTooLarge;
         const parsed = try parse(schema.State, bytes);
