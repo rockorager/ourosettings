@@ -4,6 +4,7 @@ const c = os.c;
 const a = os.a;
 const storage = @import("store.zig");
 const schema = @import("schema.zig");
+const pointer = @import("pointer.zig");
 const interface = "dev.rockorager.ouro.Settings";
 const limit = 256 * 1024; // Request bytes including NUL; one reply per client.
 var stopped: c.sig_atomic_t = 0;
@@ -18,12 +19,16 @@ const Connection = struct {
     output: ?[]u8 = null,
     sent: usize = 0,
     watching: bool = false,
+    path: ?[]u8 = null,
+    selected: ?[]u8 = null,
     deadline: i64 = 0,
     closing: bool = false,
 
     fn close(self: *Connection) void {
         if (self.fd >= 0) _ = c.close(self.fd);
         if (self.output) |bytes| a.free(bytes);
+        if (self.path) |path| a.free(path);
+        if (self.selected) |value| a.free(value);
         a.free(self.input);
         self.* = .{};
     }
@@ -47,6 +52,30 @@ const Connection = struct {
     fn snapshot(self: *Connection, store: *storage.Store) !void {
         const value = store.state.value;
         try self.reply(.{ .parameters = .{ .revision = value.revision, .settings = value.settings }, .continues = if (self.watching) @as(?bool, true) else null });
+    }
+
+    fn pathSnapshot(self: *Connection, store: *storage.Store, initial: bool) !void {
+        var selected = try pointer.selection(store.state.value.settings, self.path.?);
+        defer if (selected) |value| a.free(value);
+        if (!initial) {
+            const equal = if (selected) |value| (if (self.selected) |prior| std.mem.eql(u8, value, prior) else false) else self.selected == null;
+            // Unrelated commits neither enqueue output nor evict a slow WatchPath.
+            if (equal) return;
+        }
+        if (self.output != null) {
+            self.close();
+            return;
+        }
+        self.reply(.{ .parameters = .{ .revision = store.state.value.revision, .exists = selected != null, .value_json = selected orelse "null" }, .continues = true }) catch |err| switch (err) {
+            error.ReplyTooLarge => {
+                self.close();
+                return;
+            },
+            else => return err,
+        };
+        if (self.selected) |value| a.free(value);
+        self.selected = selected;
+        selected = null;
     }
 };
 
@@ -78,10 +107,19 @@ const Service = struct {
         if (!std.mem.eql(u8, iface, interface) and !std.mem.eql(u8, iface, "org.varlink.service")) return client.failure("org.varlink.service.InterfaceNotFound", .{ .interface = iface });
         const more = if (obj.get("more")) |v| v.bool else false;
         const watch = std.mem.eql(u8, method, interface ++ ".Watch");
-        if (watch and !more) return client.failure("org.varlink.service.ExpectedMore", struct {}{});
-        if (!watch and more) return client.invalid("more");
+        const watch_path = std.mem.eql(u8, method, interface ++ ".WatchPath");
+        if ((watch or watch_path) and !more) return client.failure("org.varlink.service.ExpectedMore", struct {}{});
+        if (!watch and !watch_path and more) return client.invalid("more");
         const params = obj.get("parameters") orelse std.json.Value{ .object = .{} };
         if (params != .object) return client.invalid("parameters");
+        if (watch_path) {
+            storage.shape(struct { path: []const u8 }, params) catch return client.invalid("path");
+            const path = params.object.get("path").?.string;
+            pointer.validate(path) catch return client.invalid("path");
+            client.path = try a.dupe(u8, path);
+            client.watching = true;
+            return client.pathSnapshot(self.store, true);
+        }
         if (std.mem.eql(u8, method, interface ++ ".Get") or watch) {
             if (params.object.count() != 0) return client.invalid("parameters");
             client.watching = watch;
@@ -120,6 +158,10 @@ const Service = struct {
             };
             if (changed) for (&self.clients) |*subscriber| {
                 if (!subscriber.watching) continue;
+                if (subscriber.path != null) {
+                    try subscriber.pathSnapshot(self.store, false);
+                    continue;
+                }
                 // Never queue behind an unsent/partially sent snapshot.
                 if (subscriber.output != null) subscriber.close() else try subscriber.snapshot(self.store);
             };
@@ -204,6 +246,7 @@ const Service = struct {
                     }
                     if (std.mem.indexOfScalar(u8, client.input[0..client.used], 0)) |end| {
                         try self.request(client, client.input[0..end]);
+                        if (client.fd < 0) continue;
                         std.mem.copyForwards(u8, client.input[0..], client.input[end + 1 .. client.used]);
                         client.used -= end + 1;
                     } else if (client.used == limit) {

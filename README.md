@@ -82,6 +82,10 @@ All replies contain `parameters`, including `{}` for parameterless errors.
   Requests and commits execute in one event loop, so subscription has no
   Get/subscribe race. EOF means resubscribe and accept the new initial snapshot;
   this is not an audit log or replay protocol.
+* **WatchPath** takes `{path}` with `more: true` and returns
+  `{revision, exists, value_json}` with `continues: true`. It sends the current
+  selection immediately, including when absent, then only when that selection
+  changes, appears or disappears. Paths use JSON Pointer as described below.
 
 Revisions are opaque, random 128-bit lowercase hex tokens, persisted with state.
 They survive restart and differ after state recreation; they are not counters
@@ -115,8 +119,75 @@ printf '%s' "$snapshot" | jq '{expected_revision: .revision,
   varlinkctl call "$address" "$interface.SetSection"
 
 varlinkctl --more --timeout=infinity call "$address" "$interface.Watch" '{}'
+varlinkctl --more --timeout=infinity call "$address" "$interface.WatchPath" \
+  '{"path":"/appearance/color_scheme"}'
 varlinkctl validate-idl protocol/dev.rockorager.ouro.Settings.varlink
 ```
+
+## WatchPath selects JSON Pointer locations, not JSONPath expressions
+
+```text
+method WatchPath(path: string) -> (revision: string, exists: bool, value_json: string)
+```
+
+`path` is an [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) **string-form
+JSON Pointer relative to the Settings object**, not the persisted envelope.
+The empty string selects all settings; `/compositor` selects that section;
+`/compositor/output_rules/internal` selects one named rule. `/revision` does not
+select the envelope's token. There is no GetPath or SetPath.
+
+Tokens are separated by `/`. Decode `~0` to `~` and `~1` to `/` exactly once:
+`~01` selects a key named `~1`, not `/`. Empty tokens select empty object keys;
+`/` selects a root key named `""` (absent in the settings schema). Object keys
+match exactly, including Unicode, without case folding or Unicode normalization.
+Numeric-looking object keys such as `01` or `-` are ordinary names. For arrays,
+indices use ASCII `0` or a nonzero digit followed by digits. Leading zeros,
+signs, whitespace, `-`, overflow and out-of-bounds indices cannot resolve an
+existing item. Missing keys and attempts to traverse a scalar/null also report
+`exists: false`; an unresolved location is not a protocol error.
+
+A nonempty pointer must start with `/`. Invalid `~` escapes, missing/non-string
+`path`, or extra parameters return `org.varlink.service.InvalidParameter` with
+`{"parameter":"path"}`. Validation checks the whole pointer, even after a
+missing ancestor. URI-fragment forms (`#/…`) are rejected; percent encoding is
+not decoded. There are no wildcards, filters, recursive descent, or textual
+prefix matching: `*` is a literal object key. Omitting `more: true` returns
+`org.varlink.service.ExpectedMore`, just as for Watch.
+
+The selected value can be any JSON type. **`value_json` is always a string
+containing JSON text**, not a Varlink object carrying an undeclared scalar.
+Current [Varlink type documentation](https://varlink.org/Interface-Definition)
+lists nullable `any`, but this project's independent Python Varlink 31 client
+rejects `any`/`?any` IDL declarations. A standard `string` keeps this API
+interoperable with that client and retains raw number lexemes without depending
+on a client's numeric precision. Decode `value_json` as JSON after checking
+`exists`. It is `"null"` when absent; stored JSON null is also `"null"` but has
+`exists: true`. Examples (each wire message is followed by NUL):
+
+```json
+{"method":"dev.rockorager.ouro.Settings.WatchPath","parameters":{"path":"/appearance/color_scheme"},"more":true}
+{"parameters":{"revision":"e2d1c0b9a8f76543210abcdef123456789","exists":true,"value_json":"\"light\""},"continues":true}
+```
+
+`examples/watch-path.json` contains independent streams against
+`examples/settings.json` for strings, arrays, objects, numbers, booleans, stored
+null and missing values. Its illustrative revisions must be replaced by the
+actual persisted token; the interoperability test checks these examples.
+
+Every commit re-resolves the pointer, even when Set or SetSection replaced an
+ancestor. Comparison uses the existing canonical snapshot rules: object order
+is normalized, array order matters, raw numeric lexemes (`1`, `1.0`, `1e0`) stay
+distinct, and null/missing/false/zero/empty collections are not conflated.
+Desktop optional nulls are absent in Get and therefore absent here too. A
+no-op or a failed write produces no event. Unrelated changes neither produce
+events nor evict a path watcher with pending output.
+
+`revision` is the **global token current at the emitted snapshot**, not a
+per-path revision. It can become stale without another event when unrelated
+settings change. Writers may need a fresh Get and must handle Conflict by
+refetching/reconsidering their update. A path stream is not a global commit
+feed: tokens can be skipped. Subscribe directly without a preceding Get; after
+EOF, reconnect for a fresh initial selection and token, not missed history.
 
 ## Version 2 schema and validation boundary
 
@@ -237,18 +308,25 @@ client including NUL, 128 KiB serialized state, 256 KiB maximum reply including
 NUL. Method/interface strings are limited to 255 bytes. Oversized frames get
 `InvalidParameter` and disconnect; excess clients are closed. Malformed JSON,
 schema, method fields/options, unknown fields, and unsupported `oneway: true` or
-`upgrade: true` receive standard errors. `more: true` is only valid for Watch;
-option flags must be booleans. Omitted parameters mean `{}`, explicit null does
-not. Fragments and combined NUL frames are supported. Non-Watch requests may be
+`upgrade: true` receive standard errors. `more: true` is only valid for Watch
+and WatchPath; option flags must be booleans. Omitted parameters mean `{}`;
+explicit null does not. Fragments and combined NUL frames are supported. Non-Watch requests may be
 pipelined: execution/replies remain ordered, one reply queued per connection.
 A Watch occupies its connection; further input closes it after its initial
-reply, without executing pipelined calls.
+reply, without executing pipelined calls. WatchPath has the same lifecycle.
 
 Requests/idle ordinary connections and queued writes have 30-second deadlines;
 incremental input does not extend a request deadline. A Watch without pending
 output has no deadline. Each subscriber has at most **one** pending snapshot
 (plus the kernel's bounded socket buffer). A mutation disconnects any subscriber
 whose previous snapshot is still pending, including partially sent snapshots.
+For WatchPath, only a changed selection can cause this backpressure disconnect;
+unrelated global commits leave its pending reply and deadline alone. Each path
+watcher additionally retains one pointer (bounded by the incoming frame limit)
+and one last selected JSON string (bounded by the outgoing frame limit), never
+an event history. Temporary resolution data is bounded by the state/frame
+limits. An encoded WatchPath reply exceeding the 256 KiB reply limit closes
+only that subscriber, never truncates the JSON or terminates the daemon.
 Clients must discard incomplete frames. Slow clients never block writers on
 socket I/O and do not build unbounded userspace queues. Disk fsync is synchronous
 and can delay the entire loop; no realtime storage latency guarantee is made.
@@ -307,34 +385,36 @@ preservation, rule names/priorities, atomic section replacement, v1 migration
 and no-clobber failures, stale writes, snapshots/no-ops/restart/reset, corruption
 retention, field bounds/duplicate keys/nulls, framing/pipelining, slow readers,
 client limits, 30-second partial-request timeout, inherited listener validation,
-idle/reactivation, private permissions, locks, and safe socket cleanup. A test-only
-LD_PRELOAD shim injects ENOSPC, file-fsync, rename and post-rename directory-fsync
-failures into real daemon I/O. Kernel RLIMIT_FSIZE and directory permissions also
+idle/reactivation, private permissions, locks, and safe socket cleanup. WatchPath
+coverage includes RFC 6901 escapes/Unicode/empty keys, index grammar, all JSON
+types, null versus missing, root selection, raw numeric lexemes, ancestor
+replacement, skipped revisions, large encoded frames and mixed subscribers.
+A test-only LD_PRELOAD shim injects ENOSPC, file-fsync, rename and post-rename
+directory-fsync failures into real daemon I/O. It also sets a small SO_SNDBUF on accepted sockets
+to verify that pending initial/later path replies survive unrelated writes but
+disconnect on a subsequent relevant change. Linux Unix sockets do not inherit
+the listener's SO_SNDBUF. Kernel RLIMIT_FSIZE and directory permissions also
 exercise actual write failures. No fault hooks exist in the daemon. Foreign-UID
 and owner tests use passwordless sudo solely for temporary fixtures; these two
 tests skip when unavailable. No real systemd manager or compositor is required.
 
-Verified for version 2 in this Linux x86_64 orb on 2026-09-09, as an
+Verified with WatchPath in this Linux x86_64 orb on 2026-09-09, as an
 unprivileged user with Zig 0.16.0:
 
 | Command | Result |
 | --- | --- |
 | `zig fmt --check build.zig build.zig.zon src` | exit 0, no formatting changes |
 | `zig build --summary all` | 3/3 steps succeeded (Debug) |
-| `zig build test --summary all` | 5/5 steps; 2/2 Zig tests; 23 integration tests, OK, 34.459s |
+| `zig build test --summary all` | 5/5 steps; 2/2 Zig tests; 29 integration tests, OK, 38.665s |
 | `zig build -Doptimize=ReleaseSafe --prefix zig-out/ReleaseSafe --summary all` | 3/3 steps succeeded |
-| `zig build test -Doptimize=ReleaseSafe --summary all` | 5/5 steps; 2/2 Zig tests; 23 integration tests, OK, 33.994s |
+| `zig build test -Doptimize=ReleaseSafe --summary all` | 5/5 steps; 2/2 Zig tests; 29 integration tests, OK, 37.487s |
 | `zig build -Doptimize=ReleaseFast --prefix zig-out/ReleaseFast --summary all` | 3/3 steps succeeded |
-| `zig build test -Doptimize=ReleaseFast --summary all` | 5/5 steps; 2/2 Zig tests; 23 integration tests, OK, 33.934s |
-| `uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings` | both IDLs parsed; independent client discovery/Get/Set/SetSection/Watch passed |
+| `zig build test -Doptimize=ReleaseFast --summary all` | 5/5 steps; 2/2 Zig tests; 29 integration tests, OK, 37.541s |
+| `uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings` | both IDLs parsed; discovery/Get/Set/SetSection/Watch/WatchPath passed, including every JSON type and filtered changes; also passed against both release binaries |
 
 No tests skipped in this orb. `varlinkctl` was unavailable; its documented
 commands were not executed, and the independent Python parser/client was used
-instead. An initial ReleaseSafe run exposed a pre-existing slow-reader test
-race: a write can disconnect a Watch before its initial snapshot is flushed.
-The test now consumes and checks the initial snapshot before withholding reads,
-then checks ordered committed snapshots and eventual backpressure disconnect.
-All three full suites above passed after that correction. Activation was tested
+instead. All three full suites above passed. Activation was tested
 with a real inherited listener, not a running systemd user manager. No services
 were installed/enabled, and no compositor integration, live desktop mutation or
 physical power-loss test was performed.

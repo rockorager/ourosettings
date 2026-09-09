@@ -20,5 +20,12 @@ method Set(expected_revision: string, settings: Settings) -> (revision: string, 
 method SetSection(expected_revision: string, section: Section, value: ?object) -> (revision: string, settings: Settings)
 method Watch() -> (revision: string, settings: Settings)
 
+# RFC 6901 string pointer relative to Settings; empty path selects its root.
+# Requires more:true. Initial selection, then only changes, with continues:true.
+# value_json contains JSON text of any type; absent is exists:false/value_json:"null".
+# Stored null is exists:true/value_json:"null". Invalid pointers: InvalidParameter(path).
+# revision is current at emission; unrelated commits may advance it silently.
+method WatchPath(path: string) -> (revision: string, exists: bool, value_json: string)
+
 error Conflict(revision: string)
 error PersistenceFailed()

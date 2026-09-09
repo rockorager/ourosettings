@@ -149,6 +149,211 @@ class DaemonTests(unittest.TestCase):
     def section(self, old, section, value):
         return self.call("SetSection", {"expected_revision": old["revision"], "section": section, "value": value})
 
+    def path_event(self, client, revision, exists, value_json):
+        self.assertEqual(client.receive(), {"parameters": {
+            "revision": revision, "exists": exists, "value_json": value_json}, "continues": True})
+
+    def test_watch_path_initial_rfc6901_and_types(self):
+        self.spawn(); old = self.get()
+        data = {"": {"": "empty"}, "a/b": {"~key": 7}, "~1": "literal tilde-one",
+                "/": "slash", "雪": "☃", "é": 1, "e\u0301": 2, "\0": False,
+                "array": [None, False, 0, "", [], {}, "last"],
+                "0": "zero key", "01": "leading zero key", "-": "dash key",
+                "*": "literal star", "%2F": "not decoded", "plain": "scalar"}
+        current = self.section(old, "compositor", {"general": data})["parameters"]
+        cases = [("", True, current["settings"]), ("/compositor", True, {"general": data}),
+                 ("/appearance/color_scheme", True, "default"), ("/appearance/accent", False, None),
+                 ("/preferred_output", False, None), ("/settings", False, None), ("/revision", False, None),
+                 ("/", False, None), ("/missing/deeper", False, None)]
+        base = "/compositor/general/"
+        cases += [(base + path, True, value) for path, value in (
+            ("/", "empty"), ("a~1b/~0key", 7), ("~01", "literal tilde-one"), ("~1", "slash"),
+            ("雪", "☃"), ("é", 1), ("e\u0301", 2), ("\0", False), ("0", "zero key"),
+            ("01", "leading zero key"), ("-", "dash key"), ("*", "literal star"), ("%2F", "not decoded"),
+            ("array", data["array"]))]
+        cases += [(base + "array/" + str(i), True, value) for i, value in enumerate(data["array"])]
+        cases += [(base + "array/" + index, False, None) for index in (
+            "7", "-", "00", "01", "-1", "+1", "1.0", "1e0", " 1", "١", "", "9" * 100)]
+        cases += [(base + "plain/0", False, None), (base + "array/0/x", False, None)]
+        for path, exists, expected in cases:
+            with self.subTest(path=path), Client(self.path) as client:
+                client.send("WatchPath", {"path": path}, more=True)
+                reply = client.receive()
+                self.assertEqual(set(reply), {"parameters", "continues"})
+                self.assertIs(reply["continues"], True)
+                params = reply["parameters"]
+                self.assertEqual(set(params), {"revision", "exists", "value_json"})
+                self.assertEqual(params["revision"], current["revision"])
+                self.assertIs(params["exists"], exists)
+                self.assertIsInstance(params["value_json"], str)
+                decoded = json.loads(params["value_json"])
+                self.assertIs(type(decoded), type(expected))  # false is not zero
+                self.assertEqual(decoded, expected)
+                if not exists: self.assertEqual(params["value_json"], "null")
+
+    def test_watch_path_validation_framing_and_lifecycle(self):
+        process = self.spawn(idle=100); old = self.get()
+        self.assertEqual(self.call("WatchPath", {"path": ""}), {"error": STANDARD + "ExpectedMore", "parameters": {}})
+        for path in ("appearance", "#", "#/compositor", "$", "/~", "/~2", "/~00~", "/missing/~x"):
+            result = self.call("WatchPath", {"path": path}, more=True)
+            self.assertEqual(result, {"error": STANDARD + "InvalidParameter", "parameters": {"parameter": "path"}})
+        for params in ({}, {"path": None}, {"path": 0}, {"path": []}, {"path": "", "extra": 0}):
+            self.assertEqual(self.call("WatchPath", params, more=True)["error"], STANDARD + "InvalidParameter")
+        for options in ({"more": None}, {"more": True, "oneway": True}, {"more": True, "upgrade": True}):
+            self.assertEqual(self.call("WatchPath", {"path": ""}, **options)["error"], STANDARD + "InvalidParameter")
+        watcher = self.client()
+        request = frame("WatchPath", {"path": "/appearance/color_scheme"}, more=True)
+        watcher.sock.sendall(request[:-1]); self.quiet(watcher)
+        watcher.sock.sendall(request[-1:]); self.path_event(watcher, old["revision"], True, '"default"')
+        time.sleep(.2); self.assertIsNone(process.poll())
+        watcher.close(); self.assertEqual(process.wait(timeout=3), 0); self.assertFalse(self.path.exists())
+        process = self.spawn(idle=100)
+        watcher = self.client()
+        # WatchPath occupies its connection exactly like Watch: never execute
+        # the pipelined mutation, and free the path/selection when closing.
+        watcher.sock.sendall(frame("WatchPath", {"path": "/missing"}, more=True) +
+            frame("SetSection", {"expected_revision": old["revision"], "section": "compositor", "value": {"bindings": None}}))
+        self.path_event(watcher, old["revision"], False, "null")
+        with self.assertRaises(EOFError): watcher.receive()
+        self.assertEqual(self.get(), old)
+        self.assertEqual(process.wait(timeout=3), 0)
+
+    def test_watch_path_large_encoded_values_and_paths(self):
+        self.spawn()
+        current = self.section(self.get(), "compositor", {"general": {"value": "\\" * 63000}})["parameters"]
+        with Client(self.path) as watcher:
+            watcher.send("WatchPath", {"path": ""}, more=True)
+            reply = watcher.receive()
+            self.assertEqual(json.loads(reply["parameters"]["value_json"]), current["settings"])
+            # JSON text adds another escaping layer but stays within the same
+            # reply limit, including NUL, without truncation or daemon failure.
+            encoded = json.dumps(reply, separators=(",", ":")).encode() + b"\0"
+            self.assertGreater(len(encoded), 250000)
+            self.assertLessEqual(len(encoded), 256 * 1024)
+        key = "/" * 63000
+        current = self.section(current, "compositor", {"general": {key: 7}})["parameters"]
+        with Client(self.path) as watcher:
+            watcher.send("WatchPath", {"path": "/compositor/general/" + "~1" * 63000}, more=True)
+            self.path_event(watcher, current["revision"], True, "7")
+            current = self.section(current, "compositor", {})["parameters"]
+            self.path_event(watcher, current["revision"], False, "null")
+        with Client(self.path) as watcher:
+            watcher.sock.sendall(frame("WatchPath", {"path": "/" * (256 * 1024)}, more=True))
+            self.assertEqual(watcher.receive()["error"], STANDARD + "InvalidParameter")
+            with self.assertRaises((EOFError, ConnectionResetError)): watcher.receive()
+        self.assertEqual(self.get(), current)
+
+    def test_watch_path_changes_ancestors_and_revision_skips(self):
+        self.spawn(); old = self.get()
+        full = self.client(); full.send("Watch", more=True); full.receive()
+        root = self.client(); root.send("WatchPath", {"path": ""}, more=True)
+        self.assertEqual(json.loads(root.receive()["parameters"]["value_json"]), old["settings"])
+        selected = self.client(); selected.send("WatchPath", {"path": "/compositor/output_rules/internal/settings/enabled"}, more=True)
+        self.path_event(selected, old["revision"], False, "null")
+        current = self.change(old)["parameters"]
+        self.assertEqual(full.receive()["parameters"], current)
+        self.assertEqual(json.loads(root.receive()["parameters"]["value_json"]), current["settings"])
+        self.quiet(selected)
+        self.assertEqual(self.section(old, "compositor", {})["error"], IFACE + ".Conflict")
+        previous = current
+        # Whole parent replacement: unchanged leaf must stay quiet even when
+        # nearby names share a textual prefix. Missing/null/false/0 are distinct.
+        steps = [({"internal-extra": {"settings": {"enabled": True}}}, False, None),
+                 ({"internal": {"settings": {"enabled": None}}}, True, "null"),
+                 ({"internal": {"settings": {"enabled": False}}}, True, "false"),
+                 ({"internal": {"priority": 7, "settings": {"enabled": False, "scale": 2}}}, False, None),
+                 ({"internal": {"settings": {"enabled": 0}}}, True, "0"),
+                 ({"internal": {"settings": {"enabled": []}}}, True, "[]"),
+                 ({"internal": {"settings": {"enabled": {}}}}, True, "{}"),
+                 ({"internal": {"settings": {"enabled": ""}}}, True, '""'),
+                 ({"internal": None}, True, None),
+                 ({"internal": {"settings": {"enabled": True}}}, True, "true")]
+        for index, (rules, changed, value) in enumerate(steps):
+            config = {"output_rules": rules}
+            if index % 2:
+                settings = copy.deepcopy(current["settings"]); settings["compositor"] = config
+                current = self.call("Set", {"expected_revision": current["revision"], "settings": settings})["parameters"]
+            else:
+                current = self.section(current, "compositor", config)["parameters"]
+            self.assertNotEqual(previous["revision"], current["revision"])
+            self.assertEqual(full.receive()["parameters"], current)
+            root_event = root.receive()["parameters"]
+            self.assertEqual(root_event["revision"], current["revision"])
+            self.assertEqual(json.loads(root_event["value_json"]), current["settings"])
+            if changed: self.path_event(selected, current["revision"], value is not None, value or "null")
+            else: self.quiet(selected)
+            previous = current
+        # No-op, failed persistence, or stale request never publish to either kind.
+        self.assertEqual(self.section(current, "compositor", config)["parameters"], current)
+        self.fault.write_text("rename")
+        self.assertEqual(self.section(current, "compositor", {})["error"], IFACE + ".PersistenceFailed")
+        self.assertEqual(self.get(), current)
+        for client in (full, root, selected): self.quiet(client)
+
+    def test_watch_path_canonical_numbers_and_array_replacement(self):
+        self.spawn(); current = self.get()
+        selected = self.client(); selected.send("WatchPath", {"path": "/compositor/general/value"}, more=True)
+        item = self.client(); item.send("WatchPath", {"path": "/compositor/general/value/1"}, more=True)
+        self.path_event(selected, current["revision"], False, "null")
+        self.path_event(item, current["revision"], False, "null")
+        for raw in ("1", "1.0", "1e0", "9007199254740993", "0.12345678901234567890",
+                    '{"z":false,"a":null}', '{"a":null,"z":false}', '["first",false]', '[false,"first"]', '[]'):
+            previous = current
+            request = frame("SetSection", {"expected_revision": current["revision"], "section": "compositor", "value": {}})
+            request = request.replace(b'"value": {}', ('"value":{"general":{"value":' + raw + '}}').encode())
+            with Client(self.path) as writer:
+                writer.sock.sendall(request); current = writer.receive()["parameters"]
+            if raw == '{"a":null,"z":false}':
+                self.assertEqual(current["revision"], previous["revision"]); self.quiet(selected)
+            else:
+                self.assertNotEqual(current["revision"], previous["revision"])
+                self.path_event(selected, current["revision"], True, '{"a":null,"z":false}' if raw.startswith('{') else raw)
+            if raw in ('["first",false]', '[false,"first"]', '[]'):
+                self.path_event(item, current["revision"], raw != '[]', 'false' if raw == '["first",false]' else ('"first"' if raw == '[false,"first"]' else 'null'))
+            else: self.quiet(item)
+        # Raw subtree equality remains unchanged even if sibling replacement
+        # advances the global revision; the next relevant event skips that token.
+        prior = current
+        current = self.section(current, "compositor", {"general": {"value": [], "other": True}})["parameters"]
+        self.assertNotEqual(current["revision"], prior["revision"])
+        self.quiet(selected); self.quiet(item)
+
+    def test_watch_path_slow_subscriber_isolation(self):
+        self.path.parent.mkdir(mode=0o700)
+        with socket.socket(socket.AF_UNIX) as listener:
+            # The test shim sets SO_SNDBUF on accepted sockets. A 90KB selection
+            # cannot flush until the client reads: test pending output, not luck.
+            self.fault.write_text("small-send-buffer")
+            listener.bind(str(self.path)); os.chmod(self.path, 0o600); listener.listen(32)
+            self.spawn(listener=listener)
+            current = self.section(self.get(), "compositor", {"general": {"large": "A" * 90000}})["parameters"]
+            initial = current
+            slow = self.client(); slow.send("WatchPath", {"path": "/compositor/general/large"}, more=True)
+            self.assertEqual(slow.sock.recv(1, socket.MSG_PEEK), b'{')
+            full = self.client(); full.send("Watch", more=True); full.receive()
+            fast = self.client(); fast.send("WatchPath", {"path": "/appearance/color_scheme"}, more=True); fast.receive()
+            for color in ("dark", "light", "dark"):
+                current = self.section(current, "appearance", {"color_scheme": color})["parameters"]
+                self.assertEqual(full.receive()["parameters"], current)
+                self.path_event(fast, current["revision"], True, json.dumps(color))
+            # Unrelated writes must not disconnect a partially sent initial reply.
+            self.path_event(slow, initial["revision"], True, json.dumps("A" * 90000)); self.quiet(slow)
+            current = self.section(current, "compositor", {"general": {"large": "B" * 90000}})["parameters"]
+            pending = current
+            self.assertEqual(slow.sock.recv(1, socket.MSG_PEEK), b'{')
+            self.assertEqual(full.receive()["parameters"], current)
+            current = self.section(current, "appearance", {"color_scheme": "light"})["parameters"]
+            self.assertEqual(full.receive()["parameters"], current)
+            self.path_event(fast, current["revision"], True, '"light"')
+            self.path_event(slow, pending["revision"], True, json.dumps("B" * 90000)); self.quiet(slow)
+            current = self.section(current, "compositor", {"general": {"large": "C" * 90000}})["parameters"]
+            self.assertEqual(slow.sock.recv(1, socket.MSG_PEEK), b'{')
+            self.assertEqual(full.receive()["parameters"], current)
+            current = self.section(current, "compositor", {"general": {"large": "D" * 90000}})["parameters"]
+            self.assertEqual(full.receive()["parameters"], current)
+            with self.assertRaises(EOFError): slow.receive()  # discard incomplete C
+            self.quiet(fast); self.assertEqual(self.get(), current)
+
     def test_section_replacement_conflict_noop_restart(self):
         process = self.spawn()
         example = json.loads((ROOT / "examples/settings.json").read_text())["settings"]
