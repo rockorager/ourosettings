@@ -1,0 +1,21 @@
+interface dev.rockorager.ouro.Settings
+
+type RGB (r: float, g: float, b: float)
+type OutputMatch (name: ?string, connector_id: ?int, connector_type: ?int, connector_type_id: ?int, width_mm: ?int, height_mm: ?int)
+type Mode (width: int, height: int, refresh_millihertz: ?int)
+type Position (x: int, y: int)
+type OutputSettings (enabled: ?bool, mode: ?Mode, position: ?Position, scale: ?float, icc_profile: ?string)
+type OutputRule (name: string, priority: int, match: OutputMatch, settings: OutputSettings)
+type Appearance (color_scheme: (default, light, dark), accent: ?RGB)
+type Wallpaper (image: ?string, fit: (fill, fit, stretch, center, tile), fallback: RGB)
+type OutputWallpaper (match: OutputMatch, wallpaper: Wallpaper)
+type Wallpapers (default: Wallpaper, outputs: []OutputWallpaper)
+type Keybinding (trigger: string, action: []string, repeat: ?bool)
+type Settings (appearance: Appearance, outputs: []OutputRule, preferred_output: ?OutputMatch, wallpaper: Wallpapers, keybindings: []Keybinding)
+
+method Get() -> (revision: string, settings: Settings)
+method Set(expected_revision: string, settings: Settings) -> (revision: string, settings: Settings)
+method Watch() -> (revision: string, settings: Settings)
+
+error Conflict(revision: string)
+error PersistenceFailed()

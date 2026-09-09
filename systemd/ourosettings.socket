@@ -1,0 +1,12 @@
+[Unit]
+Description=Ouro desired settings socket
+
+[Socket]
+ListenStream=%t/ouro/settings.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+packages=(build-essential ca-certificates curl xz-utils python3)
+missing=()
+for package in "${packages[@]}"; do
+    if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true) != 'install ok installed' ]]; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+prefix=/opt/zig-0.16.0
+if [[ ! -x $prefix/zig ]] || [[ $($prefix/zig version) != 0.16.0 ]]; then
+    case $(uname -m) in
+        x86_64) arch=x86_64; checksum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+        aarch64) arch=aarch64; checksum=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+        *) echo 'Unsupported architecture' >&2; exit 1 ;;
+    esac
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    curl -fsSL --retry 3 "https://ziglang.org/download/0.16.0/zig-${arch}-linux-0.16.0.tar.xz" -o "$scratch/zig.tar.xz"
+    echo "$checksum  $scratch/zig.tar.xz" | sha256sum --check
+    tar -xJf "$scratch/zig.tar.xz" -C "$scratch"
+    sudo mkdir -p "$prefix"
+    sudo cp -a "$scratch/zig-${arch}-linux-0.16.0/." "$prefix/"
+fi
+sudo ln -sfn "$prefix/zig" /usr/local/bin/zig
+zig version

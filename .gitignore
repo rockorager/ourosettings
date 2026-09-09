@@ -1,0 +1,5 @@
+.zig-cache/
+zig-out/
+.amp/
+PROJECTS.md
+__pycache__/

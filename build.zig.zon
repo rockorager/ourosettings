@@ -1,0 +1,7 @@
+.{
+    .name = .ourosettings,
+    .version = "0.1.0",
+    .fingerprint = 0x5f67afdb702a3467,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "protocol", "tests", "systemd", "examples", "README.md", ".agents" },
+}

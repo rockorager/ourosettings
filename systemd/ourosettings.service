@@ -1,0 +1,10 @@
+[Unit]
+Description=Ouro desired settings store
+Requires=ourosettings.socket
+After=ourosettings.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/ourosettings
+UMask=0077
+NoNewPrivileges=yes
