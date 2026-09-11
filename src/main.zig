@@ -6,6 +6,10 @@ const storage = @import("store.zig");
 const schema = @import("schema.zig");
 const mcp = @import("mcp.zig");
 const limit = mcp.record_limit;
+const initial_input_capacity = 16 * 1024;
+// One maximum frame plus a modest notification backlog, rather than scaling
+// the old four-frame budget in proportion to the new wire limit.
+const output_limit = limit + 256 * 1024;
 var stopped: c.sig_atomic_t = 0;
 fn stop(_: c_int) callconv(.c) void {
     @as(*volatile c.sig_atomic_t, &stopped).* = 1;
@@ -38,7 +42,7 @@ const Connection = struct {
         if (bytes.len >= limit) return error.ReplyTooLarge;
         if (self.output) |prior| {
             const remaining = prior.len - self.sent;
-            if (remaining + bytes.len + 1 > limit * 4) return error.ReplyTooLarge;
+            if (remaining + bytes.len + 1 > output_limit) return error.ReplyTooLarge;
             const joined = try a.alloc(u8, remaining + bytes.len + 1);
             @memcpy(joined[0..remaining], prior[self.sent..]);
             @memcpy(joined[remaining..][0..bytes.len], bytes);
@@ -123,6 +127,10 @@ const Service = struct {
                         }
                     }
                 } else if (events & c.POLLIN != 0) {
+                    if (client.used == client.input.len) {
+                        const capacity = @min(limit, client.input.len * 2);
+                        client.input = try a.realloc(client.input, capacity);
+                    }
                     const got = c.recv(client.fd, client.input[client.used..].ptr, client.input.len - client.used, 0);
                     if (got > 0) {
                         if (client.used == 0) client.request_deadline = os.now() + 30_000;
@@ -144,7 +152,7 @@ const Service = struct {
                         client.used -= end + 1;
                         if (client.output == null) client.deadline = os.now() + 30_000;
                     } else if (client.used == limit) {
-                        _ = try mcp.rpcError(client, .null, -32600, "Record exceeds 256 KiB");
+                        _ = try mcp.rpcError(client, .null, -32600, "Record exceeds 4 MiB");
                         client.closing = true;
                     }
                 }
@@ -161,7 +169,7 @@ const Service = struct {
                     }
                     var accepted = false;
                     for (&self.clients) |*client| if (client.fd < 0) {
-                        const input = a.alloc(u8, limit) catch {
+                        const input = a.alloc(u8, initial_input_capacity) catch {
                             _ = c.close(fd);
                             return error.OutOfMemory;
                         };

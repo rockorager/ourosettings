@@ -10,7 +10,7 @@ and an assistant-facing stdio bridge follow separately.
 Use MCP revision `2026-07-28`, JSON-RPC 2.0, and UTF-8 JSON records terminated by
 one newline over Unix stream sockets. A connection may carry concurrent requests
 and resource subscriptions; correlate replies by request ID, not wire order.
-Bound records to 256 KiB including the delimiter. Preserve each host's existing
+Bound records to 4 MiB including the delimiter. Preserve each host's existing
 event-loop ownership, peer checks, short-write handling, and cancellation rules.
 
 Every request carries `params._meta` with
@@ -72,11 +72,11 @@ Expose `settings.set` and `settings.set_section` through `tools/list` and
   reject omitted/null values, as before. This is not a merge operation.
 
 Success uses authoritative `structuredContent: { revision, settings }` plus
-serialized JSON in a text content block. Normally the text duplicates the full
-structured result. If that duplication would exceed the 256 KiB record limit
-including delimiter, keep the full structured result and use text JSON
-`{ revision }` instead. Do not lower the storage limit or report a committed
-mutation as a failure because of duplicated text. Tool execution failures use
+the identical serialized JSON in a text content block. The independent 128 KiB
+storage/load limit remains unchanged. Even if every stored byte requires JSON
+escaping in the text copy, two copies plus envelope overhead remain well below
+the 4 MiB wire limit, so accepted storage always has a representable response.
+Tool execution failures use
 `isError: true` and
 `structuredContent: { error: { code, message, revision? } }`. Codes are
 `Conflict`, `InvalidParameters`, and `PersistenceFailed`; `Conflict` includes

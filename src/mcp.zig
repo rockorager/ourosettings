@@ -6,7 +6,7 @@ const schema = @import("schema.zig");
 const schemas = @import("mcp_schema.zig");
 const V = std.json.Value;
 pub const version = "2026-07-28";
-pub const record_limit = 256 * 1024; // Includes the newline delimiter.
+pub const record_limit = 4 * 1024 * 1024; // Includes the newline delimiter.
 const root = "ouro://settings";
 
 pub fn descriptor(allocator: std.mem.Allocator) ![]u8 {
@@ -84,19 +84,10 @@ fn result(client: anytype, id: V, value: anytype) !bool {
     try client.reply(.{ .jsonrpc = "2.0", .id = id, .result = value });
     return false;
 }
-fn toolResult(client: anytype, id: V, value: anytype, is_error: bool, revision: ?[]const u8) !void {
+fn toolResult(client: anytype, id: V, value: anytype, is_error: bool) !void {
     const bytes = try std.json.Stringify.valueAlloc(a, value, storage.json_options);
     defer a.free(bytes);
-    var envelope = .{ .jsonrpc = "2.0", .id = id, .result = .{ .resultType = "complete", .isError = is_error, .structuredContent = value, .content = .{.{ .type = "text", .text = bytes }} } };
-    const full = try std.json.Stringify.valueAlloc(a, envelope, storage.json_options);
-    defer a.free(full);
-    if (full.len < record_limit or revision == null) return client.replyBytes(full);
-    // Do not lower the storage limit or turn a committed mutation into failure
-    // just because duplicating its snapshot in escaped text exceeds the wire cap.
-    const summary = try std.json.Stringify.valueAlloc(a, .{ .revision = revision.? }, storage.json_options);
-    defer a.free(summary);
-    envelope.result.content[0].text = summary;
-    try client.reply(envelope);
+    try client.reply(.{ .jsonrpc = "2.0", .id = id, .result = .{ .resultType = "complete", .isError = is_error, .structuredContent = value, .content = .{.{ .type = "text", .text = bytes }} } });
 }
 
 fn replaceSettings(store: *storage.Store, allocator: std.mem.Allocator, params: V, section_write: bool) !bool {
@@ -256,10 +247,10 @@ pub const Peer = struct {
                     error.PersistenceFailed => "Could not persist settings",
                     else => "Invalid settings replacement",
                 };
-                try toolResult(client, id, .{ .@"error" = .{ .code = code, .message = message, .revision = if (err == error.Conflict) @as(?[]const u8, store.state.value.revision) else null } }, true, null);
+                try toolResult(client, id, .{ .@"error" = .{ .code = code, .message = message, .revision = if (err == error.Conflict) @as(?[]const u8, store.state.value.revision) else null } }, true);
                 return false;
             };
-            toolResult(client, id, .{ .revision = store.state.value.revision, .settings = store.state.value.settings }, false, store.state.value.revision) catch |err| switch (err) {
+            toolResult(client, id, .{ .revision = store.state.value.revision, .settings = store.state.value.settings }, false) catch |err| switch (err) {
                 error.ReplyTooLarge => client.close(),
                 else => return err,
             };
@@ -291,7 +282,7 @@ pub const Peer = struct {
                 selections[i] = .{ .uri = uri.string, .path = path, .selected = try pointer.selection(store.state.value.settings, path) };
                 initialized += 1;
             }
-            try client.reply(.{ .jsonrpc = "2.0", .method = "notifications/subscriptions/acknowledged", .params = .{ ._meta = .{ .@"io.modelcontextprotocol/subscriptionId" = id }, .notifications = .{ .resourceSubscriptions = items } } });
+            try client.reply(.{ .jsonrpc = "2.0", .method = "notifications/subscriptions/acknowledged", .params = .{ ._meta = .{ .@"io.modelcontextprotocol/subscriptionId" = id }, .notifications = .{ .resourceSubscriptions = if (uris == .array) @as(?[]const V, items) else null } } });
             available.?.* = .{ .parsed = parsed, .id = id, .selections = selections };
             retained = true;
             return false;

@@ -299,17 +299,19 @@ class MCPTests(support.DaemonFixture):
         self.quiet(c)
         self.assertEqual(self.rpc(c, "resources/list")["result"]["resultType"], "complete")
         exact = frame("server/discover", id="boundary")
-        c.sock.sendall(exact[:-1] + b" " * (256 * 1024 - len(exact)) + b"\n")
+        limit = 4 * 1024 * 1024
+        c.sock.sendall(exact[:-1] + b" " * (limit - len(exact)) + b"\n")
         self.assertEqual(c.receive()["id"], "boundary")
-        c.sock.sendall(b"x" * (256 * 1024))
+        c.sock.sendall(b"x" * limit)
         self.assertEqual(c.receive()["error"]["code"], -32600)
         with self.assertRaises(EOFError): c.receive()
 
     def test_subscription_limits_and_unsupported_filters(self):
         self.spawn(); c = self.client()
         c.send("subscriptions/listen", {"notifications": {"toolsListChanged": True}}, "empty")
-        self.assertEqual(c.receive(), notification("empty", "subscriptions/acknowledged", notifications={"resourceSubscriptions": []}))
-        for i in range(7): self.listen(c, i, ["/appearance"])
+        self.assertEqual(c.receive(), notification("empty", "subscriptions/acknowledged", notifications={}))
+        self.listen(c, "explicit-empty", [])
+        for i in range(6): self.listen(c, i, ["/appearance"])
         self.assertEqual(self.rpc(c, "subscriptions/listen", {"notifications": {}}, 99)["error"]["code"], -32602)
         other = self.client()
         self.listen(other, "sixteen", ["/missing/" + str(i) for i in range(16)])
@@ -323,7 +325,7 @@ class MCPTests(support.DaemonFixture):
         path = "/compositor/general/" + key
         self.listen(c, "slow", [path] * 16)
         current = self.get()
-        for i in range(25):
+        for i in range(90):
             current = self.section(current, "compositor", {"general": {key: i}})["structuredContent"]
         c.sock.settimeout(3)
         complete = 0
@@ -335,12 +337,12 @@ class MCPTests(support.DaemonFixture):
         except EOFError:
             pass
         self.assertGreater(complete, 0)
-        self.assertLess(complete, 25 * 16)
+        self.assertLess(complete, 90 * 16)
         fast = self.client(); self.listen(fast, "fresh", [path])
-        self.assertEqual(self.read(fast, path)["value"], 24)
-        self.section(current, "compositor", {"general": {key: 25}})
+        self.assertEqual(self.read(fast, path)["value"], 89)
+        self.section(current, "compositor", {"general": {key: 90}})
         self.assertEqual(fast.receive(), notification("fresh", "resources/updated", uri=ROOT + path))
-        self.assertEqual(self.read(fast, path)["value"], 25)
+        self.assertEqual(self.read(fast, path)["value"], 90)
 
     def test_pending_read_keeps_final_invalidation_and_unrelated_suppression(self):
         self.spawn(); self.fault.write_text("small-send-buffer")
@@ -361,28 +363,45 @@ class MCPTests(support.DaemonFixture):
         self.quiet(c)
         self.assertEqual(self.read(c, "/compositor/general/value"), {"revision": current["revision"], "exists": True, "value": "final"})
 
-    def test_large_mutation_success_uses_bounded_text_summary(self):
+    def test_escaped_large_mutation_has_full_json_text_and_notification(self):
         self.spawn(); c = self.client(); writer = self.client()
         self.listen(c, "small", ["/compositor/general/n"])
         old = self.get()
-        # Near-limit valid state; duplicating it into escaped text would exceed
-        # the wire cap. The complete structured snapshot must still succeed.
+        # The duplicated, escaped result is over the former 256 KiB wire cap,
+        # while the stored snapshot remains below its independent 128 KiB cap.
         large = '"\\' * 32500
-        writer.send("tools/call", {"name": "settings.set_section", "arguments": {
-            "expected_revision": old["revision"], "section": "compositor", "value": {"general": {"large": large, "n": 19}}}})
-        response = writer.receive()
-        self.assertLessEqual(writer.last_record_size, 256 * 1024)
-        self.assertEqual(response["id"], 1)
-        self.assertIs(response["result"]["isError"], False)
-        self.assertEqual(response["result"]["resultType"], "complete")
-        self.assertEqual(c.receive(), notification("small", "resources/updated", uri=ROOT + "/compositor/general/n"))
+        result = self.tool(writer, {
+            "expected_revision": old["revision"], "section": "compositor", "value": {"general": {"large": large, "n": 19}}})
+        self.assertGreater(writer.last_record_size, 256 * 1024)
+        self.assertLess(writer.last_record_size, 4 * 1024 * 1024)
         current = self.get()
         self.assertNotEqual(current["revision"], old["revision"])
         self.assertEqual(current["settings"]["compositor"]["general"]["large"], large)
-        self.assertEqual(response["result"]["structuredContent"], current)
-        self.assertEqual(json.loads(response["result"]["content"][0]["text"]), {"revision": current["revision"]})
+        self.check_tool(result, current)
+        self.assertEqual(c.receive(), notification("small", "resources/updated", uri=ROOT + "/compositor/general/n"))
         self.assertEqual(self.read(c, "/compositor/general/n"), {"revision": current["revision"], "exists": True, "value": 19})
         self.assertEqual(self.read(writer)["value"], current["settings"])
+
+    def test_existing_large_state_loads_and_can_be_reduced(self):
+        process = self.spawn()
+        disk = json.loads(self.state.read_bytes())
+        process.terminate(); process.communicate(timeout=5)
+        disk["settings"]["compositor"] = {"general": {"large": '"\\' * 32500}}
+        encoded = json.dumps(disk, separators=(",", ":")).encode()
+        self.assertLess(len(encoded), 128 * 1024)
+        self.state.write_bytes(encoded)
+        self.spawn(); writer = self.client()
+        result = self.tool(writer, {"expected_revision": disk["revision"], "settings": disk["settings"]},
+                           name="settings.set")
+        current = self.get()
+        self.check_tool(result, current)
+        self.assertGreater(writer.last_record_size, 256 * 1024)
+        result = self.tool(writer, {"expected_revision": current["revision"], "section": "compositor",
+                                   "value": {"general": {"n": 23}}})
+        current = self.get()
+        self.assertNotEqual(current["revision"], disk["revision"])
+        self.assertEqual(current["settings"]["compositor"], {"general": {"n": 23}})
+        self.check_tool(result, current)
 
     def test_partial_request_deadline_survives_subscription_output(self):
         self.spawn(idle=300000); c = self.client(); idle = self.client()

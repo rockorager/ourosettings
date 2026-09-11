@@ -84,10 +84,9 @@ unsupported present values. This is not legacy version negotiation.
   inside the replacement are cleared. Only `preferred_output` allows omitted
   or null `value`, clearing it; `{}` instead stores an all-output selector.
   Discover exact JSON Schema 2020-12 inputs and outputs via `tools/list`.
-* Success returns full `{revision, settings}` in `structuredContent`.
-  Text normally duplicates that JSON; if duplication would exceed the 256 KiB
-  record cap including delimiter, text is only `{revision}`. Structured content
-  remains authoritative, including for large successful writes.
+* Success returns full `{revision, settings}` in `structuredContent`, with the
+  identical serialized JSON duplicated in text. The separate 128 KiB stored
+  state cap guarantees this duplicated result fits within the 4 MiB wire cap.
 * Execution failures return `isError: true` and structured
   `{error: {code, message, revision?}}`. Codes are `Conflict` (with current
   revision), `InvalidParameters`, and `PersistenceFailed`. Unknown tools and
@@ -252,10 +251,10 @@ authorization. Malicious same-UID path-replacement races are outside the trust
 boundary. State and lock files must be regular, singly linked,
 effective-UID-owned and exactly 0600; unsafe files are refused, never repaired.
 
-Records are UTF-8 JSON followed by newline, at most 256 KiB including delimiter.
+Records are UTF-8 JSON followed by newline, at most 4 MiB including delimiter.
 Maximum nesting is 64 from request/envelope root. A connection retains at most
-eight subscriptions, sixteen selected URIs total (4096 bytes per URI), and 1 MiB
-pending output. IDs are strings up to 255 bytes or signed 64-bit integers.
+eight subscriptions, sixteen selected URIs total (4096 bytes per URI), and
+4.25 MiB pending output. IDs are strings up to 255 bytes or signed 64-bit integers.
 The daemon accepts at most 32 clients, 16 accepts per poll iteration. State is
 bounded to 128 KiB. Incomplete requests and pending output have 30-second
 deadlines; incremental input/appended notifications do not extend them. An idle
