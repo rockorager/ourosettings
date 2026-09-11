@@ -271,12 +271,16 @@ fn run(init: std.process.Init) !void {
     var idle_ms: i64 = 30_000;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--help")) return os.writeAll(1, "ourosettings [--socket ABSOLUTE_PATH] [--state ABSOLUTE_PATH] [--idle-ms 1..300000]\n" ++
+        if (std.mem.eql(u8, args[i], "--help")) return os.writeAll(1, "ourosettings [--socket ABSOLUTE_PATH] [--state ABSOLUTE_PATH] [--idle-ms 1..300000] [--export-mcp-descriptor]\n" ++
             "Desired settings only: does not configure or signal Ouro.\n" ++
             "MCP: $XDG_RUNTIME_DIR/ouro/settings.mcp.sock.\n" ++
             "Accepts one validated systemd listener at fd 3.\n" ++
             "State: $XDG_CONFIG_HOME/ouro/settings.json, fallback $HOME/.config/ouro/settings.json.\n" ++
             "Explicit paths isolate tests; same-UID credentials and private permissions always apply.\n");
+        if (std.mem.eql(u8, args[i], "--export-mcp-descriptor")) {
+            try os.writeAll(1, try mcp.descriptor(init.arena.allocator()));
+            return os.writeAll(1, "\n");
+        }
         if (i + 1 >= args.len) return error.UnknownOption;
         if (std.mem.eql(u8, args[i], "--socket")) socket_path = args[i + 1] else if (std.mem.eql(u8, args[i], "--state")) state_path = args[i + 1] else if (std.mem.eql(u8, args[i], "--idle-ms")) idle_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else return error.UnknownOption;
         i += 1;

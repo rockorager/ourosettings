@@ -144,6 +144,14 @@ class MCPTests(support.DaemonFixture):
         listed = self.rpc(c, "tools/list")["result"]
         self.assertEqual({k: listed[k] for k in CACHE}, CACHE)
         self.assertEqual(len(listed["tools"]), 2)
+        exported = subprocess.check_output([support.EXE, "--export-mcp-descriptor"], env={}, timeout=3)
+        self.assertTrue(exported.endswith(b"\n"))
+        self.assertEqual(exported.count(b"\n"), 1)
+        self.assertEqual(json.loads(exported), {
+            "schema_version": 1, "application_id": "ourosettings",
+            "endpoint": {"runtime_path": "ouro/settings.mcp.sock"},
+            "tools": listed["tools"],
+        })
         for tool, name, shape in zip(listed["tools"], ("settings.set", "settings.set_section"), (FULL_INPUT, SECTION_INPUT)):
             self.assertEqual(set(tool), {"name", "description", "inputSchema", "outputSchema"})
             self.assertEqual(tool["name"], name)

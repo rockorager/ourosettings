@@ -10,6 +10,10 @@ pub fn build(b: *std.Build) void {
     });
     const exe = b.addExecutable(.{ .name = "ourosettings", .root_module = module });
     b.installArtifact(exe);
+    const export_mcp = b.addRunArtifact(exe);
+    export_mcp.addArg("--export-mcp-descriptor");
+    const descriptor = b.addInstallFile(export_mcp.captureStdOut(.{}), "share/ouro/mcp/apps/ourosettings.json");
+    b.getInstallStep().dependOn(&descriptor.step);
     const tests = b.addTest(.{ .root_module = module });
     const run_tests = b.addRunArtifact(tests);
     const integration = b.addSystemCommand(&.{ "python3", "tests/integration.py" });

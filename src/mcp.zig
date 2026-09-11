@@ -9,6 +9,15 @@ pub const version = "2026-07-28";
 pub const record_limit = 256 * 1024; // Includes the newline delimiter.
 const root = "ouro://settings";
 
+pub fn descriptor(allocator: std.mem.Allocator) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .schema_version = 1,
+        .application_id = "ourosettings",
+        .endpoint = .{ .runtime_path = "ouro/settings.mcp.sock" },
+        .tools = try schemas.tools(allocator),
+    }, storage.json_options);
+}
+
 fn eq(x: []const u8, y: []const u8) bool {
     return std.mem.eql(u8, x, y);
 }
