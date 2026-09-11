@@ -4,19 +4,20 @@ A Linux per-user **desired settings store**, written in Zig 0.16.0 with
 `std.json` and libc/POSIX. No GUI, compositor, image decoder, database, or runtime
 package dependencies beyond libc.
 
-**These settings do not affect Ouro yet.** Ouro currently reads its own
-`config.json` / `config.d` snapshots and reloads on SIGHUP; it has no settings
-Varlink client. This daemon never writes that config or signals Ouro. A future
-compositor consumer must apply desired preferences and own/report live state.
-Successful persistence does not prove that a key, action, image, ICC profile,
-device, or mode works. No import or merge with Ouro's existing configuration
-files is performed. General/layout settings, bindings, input rules and output
-rules belong together under `settings.compositor`, in Ouro's own JSON format.
+Native control uses **MCP 2026-07-28 over one Unix socket**. There is no Varlink
+endpoint or compatibility shim. Older Ourokit settings consumers must migrate
+before use. No central discovery service, HTTP transport, instance routing, or
+LLM loop is included. D-Bus/portal translation belongs in the separate
+ourobridge; Wayland and PipeWire remain their respective protocols.
 
-Native control uses Varlink (`dev.rockorager.ouro.Settings`). D-Bus/portal
-translation belongs in the separate ourobridge; Wayland and PipeWire remain
-their respective protocols. Keybindings here are user configuration, **not**
-portal GlobalShortcuts registration, permission policy, or application ownership.
+This daemon never writes Ouro's `config.json` / `config.d` or signals Ouro.
+Consumers apply desired preferences and own/report live state; the
+[MCP contract](protocol/mcp.md) defines their integration boundary. Successful
+persistence does not prove that a key, action, image, ICC profile, device, or
+mode works. There is no import or merge with Ouro's existing configuration.
+General/layout settings, bindings, input rules and output rules belong together
+under `settings.compositor`, in Ouro's own JSON format. Keybindings here are
+user configuration, not portal GlobalShortcuts registration or app permissions.
 
 ## Build and isolated execution
 
@@ -29,397 +30,299 @@ zig-out/bin/ourosettings --help
 
 # Foreground process in a separate terminal, without touching desktop config:
 testdir=$(mktemp -d)
-zig-out/bin/ourosettings --socket "$testdir/settings.sock" \
+zig-out/bin/ourosettings --socket "$testdir/settings.mcp.sock" \
   --state "$testdir/settings.json" --idle-ms 300000
 ```
 
-The explicit paths must be absolute. Missing directories are created with mode
-0700; final state/socket directories must be effective-UID-owned and exactly
-0700. Every directory component is opened without following symlinks; `.` and
-`..` components are rejected. No permissions or credentials bypass is available.
-`--idle-ms` accepts 1…300000 (default 30000). The process exits after that interval
-with no clients. An active Watch holds it alive. SIGINT/SIGTERM close clients and
-clean up a directly bound socket, only if its device/inode still matches.
+`--socket` overrides the single MCP listener. `--mcp-socket` is not accepted.
+Use `--state` as well to isolate persistence. Default paths:
 
-Default paths:
-
-* `$XDG_RUNTIME_DIR/ouro/settings.sock` (runtime directory required, private).
+* `$XDG_RUNTIME_DIR/ouro/settings.mcp.sock`.
 * `$XDG_CONFIG_HOME/ouro/settings.json`; empty/unset config home falls back to
   `$HOME/.config/ouro/settings.json`. No access to compositor `config.json`.
 
-The intended deployment is one desktop per UID. Both the socket and state path
-have private adjacent `.lock` files held with `flock` for the daemon's lifetime.
+Explicit paths must be absolute. Missing directories are created with mode
+0700; final state/socket directories must be effective-UID-owned and exactly
+0700. Every directory component is opened without following symlinks; `.` and
+`..` components are rejected. Without `--socket`, `$XDG_RUNTIME_DIR` must exist
+and be private. No permissions or credentials bypass is available.
+
+`--idle-ms` accepts 1…300000 (default 30000). The process exits after that interval
+with no clients. Active subscriptions hold it alive. SIGINT/SIGTERM close clients
+and clean up the directly bound socket only if its device/inode still matches.
+The intended deployment is one desktop per UID. The socket and state path have
+private adjacent `.lock` files held with `flock` for the daemon's lifetime.
 Explicit paths permit isolated instances; they do not identify extra desktops.
 Do not remove lock files while a daemon runs. The build installs only into
-`zig-out`; it does not install a desktop service. `.agents/setup` is committed
-locally for reproduction; with no remote/default-branch publication it is not
-automatically available to future project orbs.
+`zig-out`; it does not install a desktop service.
 
-## API and clients
+## MCP API and clients
 
-The exact IDLs are in `protocol/`, also returned by
-`org.varlink.service.GetInterfaceDescription`. Discovery lists both interfaces.
-All replies contain `parameters`, including `{}` for parameterless errors.
+Every request declares its version and capabilities in `params._meta`; there
+is no `initialize` call. `server/discover`, `tools/list`, `resources/list`,
+`resources/templates/list`, and `resources/read` return `resultType: "complete"`,
+`ttlMs: 0`, `cacheScope: "private"`. Servers always emit `resultType`; clients
+must treat an absent field as `"complete"` per MCP, but reject malformed or
+unsupported present values. This is not legacy version negotiation.
 
-* **Get** returns `{revision, settings}` as one consistent complete snapshot.
-* **Set** takes `{expected_revision, settings}` and replaces the full snapshot.
-  Validation and persistence precede publication. A mismatched token returns
-  `dev.rockorager.ouro.Settings.Conflict` with the current `revision`; refetch and
-  deliberately merge/retry, rather than blindly replaying a stale replacement.
-* **SetSection** takes `{expected_revision, section, value}` and replaces exactly
-  one of `appearance`, `compositor`, `wallpaper`, or `preferred_output`. It uses
-  the same global revision as Set, even for writers editing different sections.
-  Every unrelated preference is retained. `value` must be the complete section
-  object, not a merge patch: omitted optional fields inside it are cleared.
-  Only `preferred_output` permits omitted/null `value`, clearing that preference;
-  `{}` instead stores an all-output selector. Other sections require an object.
-  It returns the same complete snapshot as Set and shares its validation,
-  no-op, conflict, persistence and Watch behavior. On conflict, refetch and
-  reconsider the section replacement; unrelated writes also invalidate a token.
-* **Watch** requires `more: true` (otherwise standard `ExpectedMore`). It sends
-  the current complete snapshot immediately and each later committed snapshot,
-  all with `continues: true`. Subscribe directly: a preceding Get is unnecessary.
-  Requests and commits execute in one event loop, so subscription has no
-  Get/subscribe race. EOF means resubscribe and accept the new initial snapshot;
-  this is not an audit log or replay protocol.
-* **WatchPath** takes `{path}` with `more: true` and returns
-  `{revision, exists, value_json}` with `continues: true`. It sends the current
-  selection immediately, including when absent, then only when that selection
-  changes, appears or disappears. Paths use JSON Pointer as described below.
+* `resources/read` selects `ouro://settings` or a percent-encoded RFC 6901 pointer,
+  for example `ouro://settings/compositor`. It returns `application/json` text
+  containing `{revision, exists, value}`. Missing selections are readable with
+  `exists: false, value: null`; stored null has `exists: true`.
+* `tools/call` exposes `settings.set` (`{expected_revision, settings}`) and
+  `settings.set_section` (`{expected_revision, section, value?}`). Both replace,
+  never merge. A section is `appearance`, `compositor`, `wallpaper`, or
+  `preferred_output`. Unrelated sections are retained, but omitted fields
+  inside the replacement are cleared. Only `preferred_output` allows omitted
+  or null `value`, clearing it; `{}` instead stores an all-output selector.
+  Discover exact JSON Schema 2020-12 inputs and outputs via `tools/list`.
+* Success returns full `{revision, settings}` in `structuredContent`.
+  Text normally duplicates that JSON; if duplication would exceed the 256 KiB
+  record cap including delimiter, text is only `{revision}`. Structured content
+  remains authoritative, including for large successful writes.
+* Execution failures return `isError: true` and structured
+  `{error: {code, message, revision?}}`. Codes are `Conflict` (with current
+  revision), `InvalidParameters`, and `PersistenceFailed`. Unknown tools and
+  malformed RPC requests instead return JSON-RPC errors. Unsupported protocol
+  versions return `-32022` with `data.supported` and `data.requested`.
+* `subscriptions/listen` accepts `notifications.resourceSubscriptions` URI
+  filters. Its first message is `notifications/subscriptions/acknowledged`, not
+  a resource snapshot. Await acknowledgment, then read current state. Subsequent
+  `notifications/resources/updated` carry only the URI and subscription ID in
+  `_meta`. Only selected-value/existence changes notify; unrelated changes and
+  no-ops do not. Multiple subscriptions and ordinary requests share a socket.
+  Cancel with `notifications/cancelled` and `params.requestId`.
 
-Revisions are opaque, random 128-bit lowercase hex tokens, persisted with state.
-They survive restart and differ after state recreation; they are not counters
-or authorization secrets. Restoring an old backup restores its token: offline
-restoration must be treated as a new administrative session, with clients
-reconnected. A no-op is equality of the serialized snapshot (desktop optional
-nulls omitted, object key order normalized, array order retained): it preserves
-revision, performs no write, and emits no notification. Explicit `repeat: false`
-and unspecified repeat remain distinct stored preferences, though both mean no
-repeat in a final Ouro binding. Within `compositor`, nulls, omitted members,
-shorthand/object bindings and number lexemes are preserved: `1`, `1.0` and `1e0`
-are distinct because Ouro rejects non-integer tokens in integer fields. JSON
-whitespace, string escaping and object order are not preserved. External edits
-are checked before even a no-op Set or SetSection.
-
-With systemd's `varlinkctl` installed (255+ for basic calls, 257+ for the infinite
-Watch timeout), replace `address` for an isolated instance if desired:
+The standard-library client in `examples/mcp.py` makes one request, prints JSON
+responses, and does not retry. A listen request prints notifications until
+Ctrl-C. Using the isolated path above:
 
 ```sh
-address="unix:$XDG_RUNTIME_DIR/ouro/settings.sock"
-interface=dev.rockorager.ouro.Settings
-varlinkctl info "$address"
-varlinkctl introspect "$address" "$interface"
-varlinkctl call "$address" "$interface.Get" '{}'
+python3 examples/mcp.py "$testdir/settings.mcp.sock" server/discover
+python3 examples/mcp.py "$testdir/settings.mcp.sock" tools/list
+python3 examples/mcp.py "$testdir/settings.mcp.sock" resources/read \
+  '{"uri":"ouro://settings"}'
+python3 examples/mcp.py "$testdir/settings.mcp.sock" subscriptions/listen \
+  '{"notifications":{"resourceSubscriptions":["ouro://settings/appearance/color_scheme"]}}'
 
-# Read the token and replace appearance without resubmitting compositor data.
-# jq is only an example client tool, not a daemon dependency.
-snapshot=$(varlinkctl call "$address" "$interface.Get" '{}')
-printf '%s' "$snapshot" | jq '{expected_revision: .revision,
-  section: "appearance", value: (.settings.appearance | .color_scheme = "dark")}' |
-  varlinkctl call "$address" "$interface.SetSection"
-
-varlinkctl --more --timeout=infinity call "$address" "$interface.Watch" '{}'
-varlinkctl --more --timeout=infinity call "$address" "$interface.WatchPath" \
-  '{"path":"/appearance/color_scheme"}'
-varlinkctl validate-idl protocol/dev.rockorager.ouro.Settings.varlink
+# In another terminal, use a freshly read revision, not this placeholder:
+python3 examples/mcp.py "$testdir/settings.mcp.sock" tools/call \
+  '{"name":"settings.set_section","arguments":{"expected_revision":"REPLACE_WITH_CURRENT_REVISION","section":"appearance","value":{"color_scheme":"dark"}}}'
 ```
 
-## WatchPath selects JSON Pointer locations, not JSONPath expressions
+Consumers should keep at most one read outstanding per watched URI. An
+invalidation during a read marks it dirty; read again after that response.
+This closes the subscribe/read race without accumulating requests. Reconnect
+means subscribe and read again, never automatically replay a mutation. A
+selected resource's global revision can become stale after unrelated writes;
+writers must handle Conflict by refetching and reconsidering the replacement.
 
-```text
-method WatchPath(path: string) -> (revision: string, exists: bool, value_json: string)
-```
+## Resources select JSON Pointer locations
 
-`path` is an [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) **string-form
-JSON Pointer relative to the Settings object**, not the persisted envelope.
-The empty string selects all settings; `/compositor` selects that section;
-`/compositor/output_rules/internal` selects one named rule. `/revision` does not
-select the envelope's token. There is no GetPath or SetPath.
+A URI path is an [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) string-form
+JSON Pointer relative to settings, not the persisted envelope. The root URI
+selects all settings; `/compositor/output_rules/internal` selects a named rule.
+`/revision` does not select the envelope's token. There is no arbitrary-path
+mutation tool. Percent-decode the URI path once, then decode pointer tokens:
+`~0` to `~`, `~1` to `/`. `~01` selects a key named `~1`, not `/`; a literal `%2F`
+key is encoded as `%252F`. Empty tokens select empty names; `ouro://settings/`
+is not the root. Query strings, fragments, invalid UTF-8 and escapes are errors.
 
-Tokens are separated by `/`. Decode `~0` to `~` and `~1` to `/` exactly once:
-`~01` selects a key named `~1`, not `/`. Empty tokens select empty object keys;
-`/` selects a root key named `""` (absent in the settings schema). Object keys
-match exactly, including Unicode, without case folding or Unicode normalization.
-Numeric-looking object keys such as `01` or `-` are ordinary names. For arrays,
-indices use ASCII `0` or a nonzero digit followed by digits. Leading zeros,
-signs, whitespace, `-`, overflow and out-of-bounds indices cannot resolve an
-existing item. Missing keys and attempts to traverse a scalar/null also report
-`exists: false`; an unresolved location is not a protocol error.
+Object keys match exactly, including Unicode, without normalization or case
+folding. Numeric-looking object keys such as `01` and `-` are ordinary names.
+For arrays, indices are ASCII `0` or a nonzero digit followed by digits. Leading
+zeros, signs, whitespace, `-`, overflow and out-of-bounds indices cannot resolve
+an item. Traversing a scalar/null reports absence. Validate the whole pointer,
+even after a missing ancestor. No wildcards, filters, recursive descent or
+textual-prefix matching exist; `*` is a literal object key.
 
-A nonempty pointer must start with `/`. Invalid `~` escapes, missing/non-string
-`path`, or extra parameters return `org.varlink.service.InvalidParameter` with
-`{"parameter":"path"}`. Validation checks the whole pointer, even after a
-missing ancestor. URI-fragment forms (`#/…`) are rejected; percent encoding is
-not decoded. There are no wildcards, filters, recursive descent, or textual
-prefix matching: `*` is a literal object key. Omitting `more: true` returns
-`org.varlink.service.ExpectedMore`, just as for Watch.
-
-The selected value can be any JSON type. **`value_json` is always a string
-containing JSON text**, not a Varlink object carrying an undeclared scalar.
-Current [Varlink type documentation](https://varlink.org/Interface-Definition)
-lists nullable `any`, but this project's independent Python Varlink 31 client
-rejects `any`/`?any` IDL declarations. A standard `string` keeps this API
-interoperable with that client and retains raw number lexemes without depending
-on a client's numeric precision. Decode `value_json` as JSON after checking
-`exists`. It is `"null"` when absent; stored JSON null is also `"null"` but has
-`exists: true`. Examples (each wire message is followed by NUL):
-
-```json
-{"method":"dev.rockorager.ouro.Settings.WatchPath","parameters":{"path":"/appearance/color_scheme"},"more":true}
-{"parameters":{"revision":"e2d1c0b9a8f76543210abcdef123456789","exists":true,"value_json":"\"light\""},"continues":true}
-```
-
-`examples/watch-path.json` contains independent streams against
-`examples/settings.json` for strings, arrays, objects, numbers, booleans, stored
-null and missing values. Its illustrative revisions must be replaced by the
-actual persisted token; the interoperability test checks these examples.
-
-Every commit re-resolves the pointer, even when Set or SetSection replaced an
-ancestor. Comparison uses the existing canonical snapshot rules: object order
-is normalized, array order matters, raw numeric lexemes (`1`, `1.0`, `1e0`) stay
-distinct, and null/missing/false/zero/empty collections are not conflated.
-Desktop optional nulls are absent in Get and therefore absent here too. A
-no-op or a failed write produces no event. Unrelated changes neither produce
-events nor evict a path watcher with pending output.
-
-`revision` is the **global token current at the emitted snapshot**, not a
-per-path revision. It can become stale without another event when unrelated
-settings change. Writers may need a fresh Get and must handle Conflict by
-refetching/reconsidering their update. A path stream is not a global commit
-feed: tokens can be skipped. Subscribe directly without a preceding Get; after
-EOF, reconnect for a fresh initial selection and token, not missed history.
+Every commit re-resolves selections, including ancestor replacement. Object
+order is normalized, array order matters, and null/missing/false/zero/empty
+collections are distinct. Desktop optional nulls are omitted and therefore
+absent in resources too. Notifications are invalidations, not an audit log.
 
 ## Version 2 schema and validation boundary
 
-`examples/settings.json` illustrates the persisted envelope
-`{version: 2, revision, settings}`. Its token and paths are illustrative, not a
-file to copy over a running daemon. Use only its `settings` object in a Set,
-with a fresh revision from Get. Initial defaults: default color scheme, no
-accent/preferred output, black fallback wallpaper with fill fit and no
-image/per-output entries, and `compositor: {}`. No compositor defaults are
-invented or copied into this daemon.
+`examples/settings.json` illustrates `{version: 2, revision, settings}`. Its
+token and paths are illustrative, not a file to copy over a running daemon.
+Submit only its `settings` object to `settings.set` with a freshly read revision.
+Defaults: default color scheme, no accent/preferred output, black fallback
+wallpaper with fill fit and no image/per-output entries, and `compositor: {}`.
+No compositor defaults are invented or copied into this daemon.
 
 `appearance`, `compositor`, and `wallpaper` are required; `preferred_output` is
-optional. Unknown fields in daemon-owned typed structures and duplicate JSON
-keys at every depth are rejected. Desktop optional fields may be absent or
-null, meaning unspecified; responses omit them. Required fields reject null.
-Numeric strings and non-integer tokens in desktop integer fields (including
-`1.0` and `1e0`) are rejected. Arrays are replacements, not merge patches.
+optional. Unknown daemon-owned fields and duplicate JSON keys at every depth
+are rejected. Desktop optional fields may be absent or null; responses omit
+them. Required fields reject null. Desktop integer fields reject numeric strings
+and non-integer tokens, including `1.0` and `1e0`.
 
 * **Appearance:** `color_scheme` is `default`, `light`, or `dark`; optional RGB
   accent has required finite `r`, `g`, `b` components in [0, 1].
-* **Preferred output:** a separate desktop-wide OutputMatch preference, not a
-  live connected/primary-output result and not duplicated under `compositor`.
-  OutputMatch fields are conjunctive: optional byte-glob `name` (`*`/`?`, e.g.
-  `DRM-*`), u32 `connector_id`, `connector_type`, `connector_type_id`, `width_mm`,
-  `height_mm`. `{}` matches all outputs. Selection among multiple matches is a
-  consumer decision.
+* **Preferred output:** a separate desktop-wide OutputMatch preference, not live
+  connected/primary-output state. Fields are conjunctive: optional byte-glob
+  `name` (`*`/`?`), u32 `connector_id`, `connector_type`, `connector_type_id`,
+  `width_mm`, `height_mm`. `{}` matches all. Consumers choose among matches.
 * **Wallpaper:** required `default` preference and `outputs` array of
-  `{match, wallpaper}` entries. Matching uses OutputMatch above. Per-output
-  entries replace the whole wallpaper preference; if several match, the last
-  array entry wins. Identical selectors are rejected to avoid shadowed entries;
+  `{match, wallpaper}` entries. Each matching entry replaces the whole wallpaper
+  preference; the last matching entry wins. Identical selectors are rejected;
   overlapping selectors are allowed. Each preference has optional `image`,
   required fit (`fill`, `fit`, `stretch`, `center`, `tile`) and fallback RGB.
-  Image policy: **absolute local filesystem paths only**, NUL-free. All URI
-  schemes, including `file:`, and relative paths are rejected. No expansion,
-  existence checks, decoding, downloads, rendering, or symlink resolution of
-  image/profile paths occur. No image means fallback-only; a consumer also uses
-  fallback when it cannot render an image. Fit modes mean aspect-preserving
-  cover/contain, nonuniform stretch, native-size center, or native-size tiling.
-* **Compositor:** a standard Varlink `object`, not a JSON-encoded string or a
-  daemon-specific action/rule schema. The daemon requires an object whose only
-  members are `general`, `bindings`, `input_rules`, and `output_rules`, each
-  either an object or null. Their contents remain raw JSON, including unknown
-  nested fields, partial rules/bindings, numbers and nulls. The daemon does not
-  claim these contents pass Ouro validation. Ouro owns field types/ranges,
-  triggers/XKB, action vocabulary/arity, rule matching, hardware support, scale
-  quantization, and ICC loading/application. This boundary avoids a second
-  incompatible schema and supports input reset unions and dynamic keys without
-  normalizing away their meaning. Desktop sections remain typed in the IDL;
-  `SetSection.value` is `?object` because its type depends on `section`.
+  Image paths must be absolute local filesystem paths without NUL. URI schemes
+  (including `file:`) and relative paths are rejected. No expansion, existence
+  checks, image decoding, download, rendering or symlink resolution of image/ICC
+  paths occurs. Missing/unrenderable images use fallback. Fit modes mean
+  aspect-preserving cover/contain, nonuniform stretch, native-size center/tiling.
+* **Compositor:** an object with only `general`, `bindings`, `input_rules`, and
+  `output_rules`, each an object or null. Their contents remain raw JSON,
+  including unknown nested fields, partial rules/bindings, numbers and nulls.
+  Ouro owns field types/ranges, triggers/XKB, action vocabulary/arity, rule
+  matching, hardware support, scale quantization and ICC loading/application.
+  Desktop structures have typed schemas; section input schemas reflect the
+  selected section. Semantic validation, including duplicate wallpaper
+  selectors, always runs on the server.
 
-Authoritative config contract inspected in upstream Ouro
-[`1394e361`](https://github.com/rockorager/ouro/commit/1394e361993e100775d680ef9585fe9a1a7ce4ce),
-`src/config.zig` (parser and tests) and `src/runtime/settings.zig`:
+The compositor contract follows Ouro's `src/config.zig` and
+`src/runtime/settings.zig`:
 
 * `general` contains `focus_follows_mouse`, `inner_gap`, `outer_gap`.
 * `bindings` maps exact trigger strings to action argv arrays or
   `{action: [...], repeat?: bool}`. Argument order, case and empty arguments
-  remain intact. No actions are executed here.
-* `input_rules` and `output_rules` are **objects keyed by rule name**, not
-  arrays. Rules carry optional `priority`, `match`, `settings`. Ouro applies
-  matching rules in ascending `(priority, name)` order, with later specified
-  settings winning. JSON object order is irrelevant; names and priorities are
-  retained. Output settings include enabled/mode/position/scale/ICC preferences;
-  input settings include device toggles, acceleration, scrolling and repeat.
-* Ouro layers config sources using RFC 7396 over its built-in defaults. An
-  omitted member leaves the underlying value alone; null deletes that member.
-  `bindings: null` clears the binding class; `bindings: {}` does not clear
-  built-in bindings. Null nested members remove overrides. Input `"default"`
-  explicitly resets to a device/software default and is distinct from absent
-  or null, which contributes no override to rule resolution. General and input
-  omissions leave Ouro's own default behavior in charge.
+  remain intact. No actions execute here.
+* `input_rules` and `output_rules` are objects keyed by rule name, not arrays.
+  Rules carry optional `priority`, `match`, `settings`. Ouro applies matching
+  rules in ascending `(priority, name)` order, later specified settings winning.
+* Ouro layers configuration sources using RFC 7396 over its defaults. Omission
+  leaves underlying values alone; null deletes a member. `bindings: null` clears
+  the class; `bindings: {}` does not clear built-in bindings. Input `"default"`
+  resets to a device/software default, distinct from absent/null overrides.
 
-The stored `compositor` is one desired Ouro-format configuration source, not
-resolved live state. Set/SetSection replace that entire stored source; they do
-**not** apply RFC 7396 to the previous stored source. Future consumers must
-define how this source participates in Ouro's configuration layering; none is
-implemented here. A partial source can be valid only in combination with other
-sources, so persistence cannot guarantee final compositor validity.
+The stored compositor object is one desired configuration source, not resolved
+live state. Both mutation tools replace their target; they do **not** apply
+RFC 7396 to the previous stored source. A partial source may be valid only in
+combination with others, so persistence cannot guarantee compositor validity.
+
+Revisions are opaque random 128-bit lowercase hex tokens, persisted with state,
+not counters or authorization secrets. They survive restart and differ after
+state recreation. Restoring a backup restores its token: treat offline restores
+as new administrative sessions with clients reconnected. A no-op compares the
+canonical serialized snapshot: optional desktop nulls omitted, object key order
+normalized, array order retained. It preserves revision, does not write and
+does not notify. Within compositor JSON, nulls, omitted members, shorthand/object
+bindings and number lexemes are retained: `1`, `1.0`, `1e0` differ in Ouro integer
+validation. Explicit `repeat: false` and unspecified repeat remain distinct.
+Whitespace, string escaping and object order are not preserved. External edits
+are checked before even a no-op mutation.
 
 ## Version 1 migration is atomic and fail-closed
 
-Startup automatically validates version 1 using its original strict schema,
-then converts `outputs` to `compositor.output_rules` keyed by each rule's name,
-and `keybindings` to `compositor.bindings` keyed by each exact trigger. Priority,
-match/settings, argv order and optional repeat are retained. Array order was
-not rule precedence in version 1; `(priority, name)` still determines it.
-Appearance, preferred output and wallpaper remain unchanged (legacy optional
-nulls still mean absent). General and input rules remain absent. Empty legacy
-collections become empty objects, not null class deletions; migration neither
+Startup validates version 1 against its original strict schema, then converts
+`outputs` to `compositor.output_rules` keyed by rule name and `keybindings` to
+`compositor.bindings` keyed by exact trigger. Priority, match/settings, argv
+order and optional repeat survive. Array order was not rule precedence in
+version 1; `(priority, name)` still determines it. Appearance, preferred output
+and wallpaper remain unchanged. General/input rules remain absent. Empty old
+collections become empty objects, not null class deletions. Migration neither
 imports nor clears Ouro's existing configuration.
 
-The converted envelope is version 2 with a **fresh global revision**, atomically
-persisted before any requests or initial Watch snapshot are served. Old tokens
-cannot overwrite migrated preferences; clients must refetch and use the new
-schema. Version 2 retains its revision on subsequent restarts. Migration is
-one-way; back up the stopped daemon's file before upgrading if rollback is
-needed. The old executable will refuse version 2 rather than downgrade it.
+The version 2 envelope receives a fresh global revision, persisted atomically
+before serving requests. Old tokens cannot overwrite migrated preferences.
+Version 2 retains its revision on restart. Migration is one-way; back up the
+stopped daemon's file before upgrading if rollback is needed. Old executables
+refuse version 2 rather than downgrade it.
 
-Invalid revisions, duplicate/ambiguous legacy names or triggers, unknown fields,
-malformed JSON, unsupported versions or an oversized result abort startup
-without rewriting the original file. Pre-rename migration write/fsync/rename
-failures also leave the original intact. Post-rename directory-fsync failure
-has the same ambiguous-commit behavior described below; restart and inspect.
-No best-effort dropping of unsupported data and no repair of unsafe files occurs.
+Invalid revisions, duplicate/ambiguous old names or triggers, unknown fields,
+malformed JSON, unsupported versions and oversized results abort startup
+without rewriting the file. Pre-rename write/fsync/rename failures also leave it
+intact. Post-rename directory-fsync failure is ambiguous as described below.
+There is no best-effort dropping of data or repair of unsafe files.
 
-## Transport, persistence, and failure semantics
+## Security, bounds and persistence
 
-Native Linux AF_UNIX stream, bounded NUL-terminated UTF-8 JSON (maximum nesting
-depth 64 from the request/envelope root). Same-effective-UID
-`SO_PEERCRED` is checked on each accepted connection; other UIDs receive standard
-`PermissionDenied` best-effort before disconnect. Private socket mode is 0600.
-**This is UID isolation, not sandbox/app authorization.** A process with the same
-UID can configure the desktop and access these files; malicious same-UID path
-replacement races are outside the trust boundary.
+The socket requires same-effective-UID `SO_PEERCRED` and mode 0600. Foreign peers
+are disconnected without a response. This is UID isolation, not app
+authorization. Malicious same-UID path-replacement races are outside the trust
+boundary. State and lock files must be regular, singly linked,
+effective-UID-owned and exactly 0600; unsafe files are refused, never repaired.
 
-At most 32 clients, 16 accepts per poll iteration, 256 KiB incoming buffer per
-client including NUL, 128 KiB serialized state, 256 KiB maximum reply including
-NUL. Method/interface strings are limited to 255 bytes. Oversized frames get
-`InvalidParameter` and disconnect; excess clients are closed. Malformed JSON,
-schema, method fields/options, unknown fields, and unsupported `oneway: true` or
-`upgrade: true` receive standard errors. `more: true` is only valid for Watch
-and WatchPath; option flags must be booleans. Omitted parameters mean `{}`;
-explicit null does not. Fragments and combined NUL frames are supported. Non-Watch requests may be
-pipelined: execution/replies remain ordered, one reply queued per connection.
-A Watch occupies its connection; further input closes it after its initial
-reply, without executing pipelined calls. WatchPath has the same lifecycle.
+Records are UTF-8 JSON followed by newline, at most 256 KiB including delimiter.
+Maximum nesting is 64 from request/envelope root. A connection retains at most
+eight subscriptions, sixteen selected URIs total (4096 bytes per URI), and 1 MiB
+pending output. IDs are strings up to 255 bytes or signed 64-bit integers.
+The daemon accepts at most 32 clients, 16 accepts per poll iteration. State is
+bounded to 128 KiB. Incomplete requests and pending output have 30-second
+deadlines; incremental input/appended notifications do not extend them. An idle
+subscription has no deadline. Overflow disconnects the client, never silently
+discards its final invalidation on a live stream. Discard incomplete records
+after EOF. Slow clients cannot block other clients' socket I/O. Disk fsync is
+synchronous and can delay the entire loop; no realtime latency is promised.
 
-Requests/idle ordinary connections and queued writes have 30-second deadlines;
-incremental input does not extend a request deadline. A Watch without pending
-output has no deadline. Each subscriber has at most **one** pending snapshot
-(plus the kernel's bounded socket buffer). A mutation disconnects any subscriber
-whose previous snapshot is still pending, including partially sent snapshots.
-For WatchPath, only a changed selection can cause this backpressure disconnect;
-unrelated global commits leave its pending reply and deadline alone. Each path
-watcher additionally retains one pointer (bounded by the incoming frame limit)
-and one last selected JSON string (bounded by the outgoing frame limit), never
-an event history. Temporary resolution data is bounded by the state/frame
-limits. An encoded WatchPath reply exceeding the 256 KiB reply limit closes
-only that subscriber, never truncates the JSON or terminates the daemon.
-Clients must discard incomplete frames. Slow clients never block writers on
-socket I/O and do not build unbounded userspace queues. Disk fsync is synchronous
-and can delay the entire loop; no realtime storage latency guarantee is made.
+Corrupt/unknown-version state aborts startup and stays byte-for-byte intact.
+The store retains an open directory fd and compares disk bytes before mutations,
+refusing external edits/deletion. Do not edit or restore state concurrently;
+advisory locks coordinate daemons, not arbitrary editors. A private same-directory
+O_EXCL temporary file is written fully, fsynced, renamed over state, then the
+directory is fsynced. New directory entries have their parents fsynced too.
 
-State and lock files must be regular, singly linked, effective-UID-owned, exactly
-0600; symlinks and unsafe existing permissions are refused, never repaired.
-Corrupt/unknown-version state aborts startup and remains byte-for-byte intact.
-The store retains an open directory fd and compares existing disk bytes before
-Set, refusing external edits/deletion rather than overwriting them. Do not edit
-or restore state concurrently; the advisory lock coordinates daemon instances,
-not arbitrary text editors. A private same-directory O_EXCL temporary file is
-written fully, fsynced, renamed over state, then the directory is fsynced. Newly
-created directory entries have their parents fsynced as well.
-
-Before rename, failure returns `PersistenceFailed {}` without changing memory,
-revision, the old file, or Watch events. Temporary files are cleaned up during
-normal failures; a crash can leave harmless private `.settings-*.tmp` orphans
-that are not loaded or automatically removed. Rename is the namespace commit
-boundary. **If directory fsync fails after rename, durability is ambiguous:**
-the daemon exits nonzero, closes all connections, and sends neither a success
-nor a misleading ordinary failure. The new file may already be visible and may
-or may not survive power loss. Reconnect/restart and Get before deciding what
-to retry. Likewise, losing a connection after commit but before its reply does
-not imply failure. No software test proves physical storage power-loss behavior.
+Before rename, failure returns `PersistenceFailed` without changing memory,
+revision, the old file or notifications. Temporary files are cleaned up on
+normal failures; a crash can leave private `.settings-*.tmp` orphans that are
+not loaded or automatically removed. Rename is the namespace commit boundary.
+**Directory-fsync failure after rename is ambiguous:** the daemon exits nonzero,
+closes all connections and sends neither success nor a misleading ordinary
+failure. The new file may already be visible but may not survive power loss.
+Restart and read before deciding what to retry. Losing a reply after commit
+also does not imply failure. Software tests cannot prove physical power-loss
+behavior.
 
 ## Socket activation is opt-in
 
-`systemd/ourosettings.socket` and `.service` are inert example **user** units:
-Accept=no, Type=exec, 0600 socket, 0700 directories, no restart loop. Installation
-is a separate operator action; adjust `/usr/local/bin/ourosettings` to the actual
-installed binary. Nothing here enables, starts, or installs these units.
+`systemd/ourosettings.socket` and `.service` are inert example user units:
+one `ListenStream=%t/ouro/settings.mcp.sock`, Accept=no, Type=exec, 0600 socket,
+0700 directories, no restart loop. Installation is a separate operator action;
+adjust `/usr/local/bin/ourosettings` to the installed binary. Nothing here
+enables, starts or installs these units. Replace old dual-listener unit files
+when upgrading; this daemon rejects multiple inherited descriptors.
 
-Activation requires both `LISTEN_PID` equal to this PID and exactly
-`LISTEN_FDS=1`. fd 3 must be a listening Unix stream at the exact configured
-path; pathname owner/mode/type are checked. The daemon sets nonblocking/CLOEXEC
-and preserves activated sockets on exit. The socket owner (systemd) can retain
-queued connections and reactivate the process. A directly started daemon never
-unlinks an existing endpoint, even a stale socket: after an abnormal exit the
-operator must first establish that no daemon owns it, then remove it. Graceful
-direct shutdown removes only its own endpoint.
+Activation requires `LISTEN_PID` equal to this PID, `LISTEN_FDS=1`, and fd 3
+being a listening Unix stream at the exact configured path. Owner, mode and
+socket type are checked. The daemon sets nonblocking/CLOEXEC and preserves
+activated paths on exit, including replacement inodes. The socket owner can
+retain queued connections and reactivate the process. A directly started
+daemon never unlinks an existing endpoint, even stale: after an abnormal exit,
+the operator must establish that no daemon owns it before removing it.
+Graceful direct shutdown removes only the device/inode it bound.
 
 ## Verification
 
 ```sh
 zig fmt --check build.zig build.zig.zon src
 zig build && zig build test --summary all
-zig build -Doptimize=ReleaseSafe && zig build test -Doptimize=ReleaseSafe --summary all
-zig build -Doptimize=ReleaseFast && zig build test -Doptimize=ReleaseFast --summary all
-# Optional independent parser/client, not a runtime dependency:
-uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings
+zig build test -Doptimize=ReleaseSafe --summary all
+
+# Optional official schema cross-check; ordinary tests need only Python:
+curl -fsSL https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2026-07-28/schema.json \
+  -o /tmp/ourosettings-mcp-schema.json
+MCP_OFFICIAL_SCHEMA=/tmp/ourosettings-mcp-schema.json \
+  uv run --with jsonschema python tests/mcp.py zig-out/bin/ourosettings
 ```
 
-Integration tests start the actual executable on isolated Unix sockets, not mock
-services. They cover Ouro config examples, null/default/omission and argv
-preservation, rule names/priorities, atomic section replacement, v1 migration
-and no-clobber failures, stale writes, snapshots/no-ops/restart/reset, corruption
-retention, field bounds/duplicate keys/nulls, framing/pipelining, slow readers,
-client limits, 30-second partial-request timeout, inherited listener validation,
-idle/reactivation, private permissions, locks, and safe socket cleanup. WatchPath
-coverage includes RFC 6901 escapes/Unicode/empty keys, index grammar, all JSON
-types, null versus missing, root selection, raw numeric lexemes, ancestor
-replacement, skipped revisions, large encoded frames and mixed subscribers.
+`tests/integration.py` preserves storage/security/lifecycle coverage over MCP:
+v1 migration and failed-migration retention, full/section replacement, stale
+writers and no-ops, null/default/omission/argv/raw-number preservation, schema
+bounds, corrupt/external state retention, locks/symlinks/permissions, client/state
+limits, defaults, obsolete flag rejection, and activation/idle/reactivation.
+`tests/mcp.py` covers independently authored discovered schemas and envelopes,
+structured errors, URI escaping and all JSON types, selected-value filtering,
+same-connection listen/read/call/cancel, multiple IDs, fragmented/coalesced
+records, backpressure/final invalidation, near-limit successful responses,
+the real 30-second deadline and inode-safe single-listener activation.
+
 A test-only LD_PRELOAD shim injects ENOSPC, file-fsync, rename and post-rename
-directory-fsync failures into real daemon I/O. It also sets a small SO_SNDBUF on accepted sockets
-to verify that pending initial/later path replies survive unrelated writes but
-disconnect on a subsequent relevant change. Linux Unix sockets do not inherit
-the listener's SO_SNDBUF. Kernel RLIMIT_FSIZE and directory permissions also
-exercise actual write failures. No fault hooks exist in the daemon. Foreign-UID
-and owner tests use passwordless sudo solely for temporary fixtures; these two
-tests skip when unavailable. No real systemd manager or compositor is required.
-
-Verified with WatchPath in this Linux x86_64 orb on 2026-09-09, as an
-unprivileged user with Zig 0.16.0:
-
-| Command | Result |
-| --- | --- |
-| `zig fmt --check build.zig build.zig.zon src` | exit 0, no formatting changes |
-| `zig build --summary all` | 3/3 steps succeeded (Debug) |
-| `zig build test --summary all` | 5/5 steps; 2/2 Zig tests; 29 integration tests, OK, 38.665s |
-| `zig build -Doptimize=ReleaseSafe --prefix zig-out/ReleaseSafe --summary all` | 3/3 steps succeeded |
-| `zig build test -Doptimize=ReleaseSafe --summary all` | 5/5 steps; 2/2 Zig tests; 29 integration tests, OK, 37.487s |
-| `zig build -Doptimize=ReleaseFast --prefix zig-out/ReleaseFast --summary all` | 3/3 steps succeeded |
-| `zig build test -Doptimize=ReleaseFast --summary all` | 5/5 steps; 2/2 Zig tests; 29 integration tests, OK, 37.541s |
-| `uv run --with varlink==31.0.0 python tests/interop.py zig-out/bin/ourosettings` | both IDLs parsed; discovery/Get/Set/SetSection/Watch/WatchPath passed, including every JSON type and filtered changes; also passed against both release binaries |
-
-No tests skipped in this orb. `varlinkctl` was unavailable; its documented
-commands were not executed, and the independent Python parser/client was used
-instead. All three full suites above passed. Activation was tested
-with a real inherited listener, not a running systemd user manager. No services
-were installed/enabled, and no compositor integration, live desktop mutation or
-physical power-loss test was performed.
-
-References: [ouroshot](https://github.com/rockorager/ouroshot) Linux activation,
-peer credentials, and framing; [Ouro](https://github.com/rockorager/ouro)
-`src/runtime/settings.zig` and `src/config.zig` output/binding semantics. Capture
-machinery, portal policy, and compositor validation engines are not copied here.
+directory-fsync failures into real daemon I/O. It sets a small accepted-socket
+SO_SNDBUF to exercise queued output deterministically. RLIMIT_FSIZE and directory
+permissions test kernel failures too. No daemon fault hooks exist. Foreign-UID
+tests use passwordless sudo only for temporary fixtures and skip if unavailable.
+The optional official-schema mode validates received responses/notifications
+against the published schema, as well as tool schemas and execution results.
+Activation uses real inherited listeners, not a running systemd manager.
+No shared services, live desktop state or physical power-loss tests are needed.

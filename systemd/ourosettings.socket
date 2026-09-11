@@ -1,8 +1,8 @@
 [Unit]
-Description=Ouro desired settings socket
+Description=Ouro desired settings MCP socket
 
 [Socket]
-ListenStream=%t/ouro/settings.sock
+ListenStream=%t/ouro/settings.mcp.sock
 SocketMode=0600
 DirectoryMode=0700
 Accept=no

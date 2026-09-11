@@ -4,9 +4,8 @@ const c = os.c;
 const a = os.a;
 const storage = @import("store.zig");
 const schema = @import("schema.zig");
-const pointer = @import("pointer.zig");
-const interface = "dev.rockorager.ouro.Settings";
-const limit = 256 * 1024; // Request bytes including NUL; one reply per client.
+const mcp = @import("mcp.zig");
+const limit = mcp.record_limit;
 var stopped: c.sig_atomic_t = 0;
 fn stop(_: c_int) callconv(.c) void {
     @as(*volatile c.sig_atomic_t, &stopped).* = 1;
@@ -18,64 +17,43 @@ const Connection = struct {
     used: usize = 0,
     output: ?[]u8 = null,
     sent: usize = 0,
-    watching: bool = false,
-    path: ?[]u8 = null,
-    selected: ?[]u8 = null,
     deadline: i64 = 0,
+    request_deadline: i64 = 0,
     closing: bool = false,
+    peer: mcp.Peer = .{},
 
-    fn close(self: *Connection) void {
+    pub fn close(self: *Connection) void {
         if (self.fd >= 0) _ = c.close(self.fd);
         if (self.output) |bytes| a.free(bytes);
-        if (self.path) |path| a.free(path);
-        if (self.selected) |value| a.free(value);
+        self.peer.deinit();
         a.free(self.input);
         self.* = .{};
     }
-    fn reply(self: *Connection, value: anytype) !void {
-        std.debug.assert(self.output == null);
+    pub fn reply(self: *Connection, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(a, value, storage.json_options);
         defer a.free(bytes);
+        try self.replyBytes(bytes);
+    }
+    pub fn replyBytes(self: *Connection, bytes: []const u8) !void {
         if (bytes.len >= limit) return error.ReplyTooLarge;
-        self.output = try a.alloc(u8, bytes.len + 1);
-        @memcpy(self.output.?[0..bytes.len], bytes);
-        self.output.?[bytes.len] = 0;
-        self.sent = 0;
-        self.deadline = os.now() + 30_000;
-    }
-    fn failure(self: *Connection, name: []const u8, parameters: anytype) !void {
-        try self.reply(.{ .@"error" = name, .parameters = parameters });
-    }
-    fn invalid(self: *Connection, name: []const u8) !void {
-        try self.failure("org.varlink.service.InvalidParameter", .{ .parameter = if (name.len <= 255) name else "request" });
-    }
-    fn snapshot(self: *Connection, store: *storage.Store) !void {
-        const value = store.state.value;
-        try self.reply(.{ .parameters = .{ .revision = value.revision, .settings = value.settings }, .continues = if (self.watching) @as(?bool, true) else null });
-    }
-
-    fn pathSnapshot(self: *Connection, store: *storage.Store, initial: bool) !void {
-        var selected = try pointer.selection(store.state.value.settings, self.path.?);
-        defer if (selected) |value| a.free(value);
-        if (!initial) {
-            const equal = if (selected) |value| (if (self.selected) |prior| std.mem.eql(u8, value, prior) else false) else self.selected == null;
-            // Unrelated commits neither enqueue output nor evict a slow WatchPath.
-            if (equal) return;
-        }
-        if (self.output != null) {
-            self.close();
+        if (self.output) |prior| {
+            const remaining = prior.len - self.sent;
+            if (remaining + bytes.len + 1 > limit * 4) return error.ReplyTooLarge;
+            const joined = try a.alloc(u8, remaining + bytes.len + 1);
+            @memcpy(joined[0..remaining], prior[self.sent..]);
+            @memcpy(joined[remaining..][0..bytes.len], bytes);
+            joined[joined.len - 1] = '\n';
+            a.free(prior);
+            self.output = joined;
+            self.sent = 0;
+            // Appending output must not extend the oldest queued deadline.
             return;
         }
-        self.reply(.{ .parameters = .{ .revision = store.state.value.revision, .exists = selected != null, .value_json = selected orelse "null" }, .continues = true }) catch |err| switch (err) {
-            error.ReplyTooLarge => {
-                self.close();
-                return;
-            },
-            else => return err,
-        };
-        if (self.selected) |value| a.free(value);
-        self.selected = selected;
-        selected = null;
+        self.output = try a.alloc(u8, bytes.len + 1);
+        @memcpy(self.output.?[0..bytes.len], bytes);
+        self.output.?[bytes.len] = '\n';
+        self.sent = 0;
+        self.deadline = os.now() + 30_000;
     }
 };
 
@@ -84,102 +62,18 @@ const Service = struct {
     listener: c_int,
     clients: [32]Connection = @splat(.{}),
 
+    fn publish(self: *Service) !void {
+        for (&self.clients) |*subscriber| {
+            if (subscriber.fd < 0) continue;
+            subscriber.peer.notify(subscriber, self.store) catch |err| switch (err) {
+                error.ReplyTooLarge => subscriber.close(),
+                else => return err,
+            };
+        }
+    }
+
     fn request(self: *Service, client: *Connection, bytes: []const u8) !void {
-        var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch return client.invalid("request");
-        defer parsed.deinit();
-        storage.normalize(&parsed.value, 0) catch return client.invalid("request");
-        if (parsed.value != .object) return client.invalid("request");
-        const obj = parsed.value.object;
-        var it = obj.iterator();
-        while (it.next()) |entry| {
-            const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "method") or std.mem.eql(u8, key, "parameters")) continue;
-            if (!std.mem.eql(u8, key, "more") and !std.mem.eql(u8, key, "oneway") and !std.mem.eql(u8, key, "upgrade")) return client.invalid(key);
-            if (entry.value_ptr.* != .bool) return client.invalid(key);
-            if (!std.mem.eql(u8, key, "more") and entry.value_ptr.bool) return client.invalid(key);
-        }
-        const method_value = obj.get("method") orelse return client.invalid("method");
-        if (method_value != .string) return client.invalid("method");
-        const method = method_value.string;
-        if (method.len > 255 or std.mem.indexOfScalar(u8, method, 0) != null) return client.invalid("method");
-        const dot = std.mem.lastIndexOfScalar(u8, method, '.') orelse return client.invalid("method");
-        const iface = method[0..dot];
-        if (!std.mem.eql(u8, iface, interface) and !std.mem.eql(u8, iface, "org.varlink.service")) return client.failure("org.varlink.service.InterfaceNotFound", .{ .interface = iface });
-        const more = if (obj.get("more")) |v| v.bool else false;
-        const watch = std.mem.eql(u8, method, interface ++ ".Watch");
-        const watch_path = std.mem.eql(u8, method, interface ++ ".WatchPath");
-        if ((watch or watch_path) and !more) return client.failure("org.varlink.service.ExpectedMore", struct {}{});
-        if (!watch and !watch_path and more) return client.invalid("more");
-        const params = obj.get("parameters") orelse std.json.Value{ .object = .{} };
-        if (params != .object) return client.invalid("parameters");
-        if (watch_path) {
-            storage.shape(struct { path: []const u8 }, params) catch return client.invalid("path");
-            const path = params.object.get("path").?.string;
-            pointer.validate(path) catch return client.invalid("path");
-            client.path = try a.dupe(u8, path);
-            client.watching = true;
-            return client.pathSnapshot(self.store, true);
-        }
-        if (std.mem.eql(u8, method, interface ++ ".Get") or watch) {
-            if (params.object.count() != 0) return client.invalid("parameters");
-            client.watching = watch;
-            return client.snapshot(self.store);
-        }
-        const section_write = std.mem.eql(u8, method, interface ++ ".SetSection");
-        if (std.mem.eql(u8, method, interface ++ ".Set") or section_write) {
-            var settings = self.store.state.value.settings;
-            const allocator = parsed.arena.allocator();
-            const expected_revision = if (section_write) blk: {
-                const SetSection = struct { expected_revision: []const u8, section: schema.Section, value: ?std.json.Value = null };
-                storage.shape(SetSection, params) catch return client.invalid("parameters");
-                const update = std.json.parseFromValueLeaky(SetSection, allocator, params, .{}) catch return client.invalid("section");
-                const value = update.value orelse std.json.Value.null;
-                switch (update.section) {
-                    inline else => |section| {
-                        const T = @FieldType(schema.Settings, @tagName(section));
-                        storage.shape(T, value) catch return client.invalid("value");
-                        @field(settings, @tagName(section)) = std.json.parseFromValueLeaky(T, allocator, value, .{}) catch return client.invalid("value");
-                    },
-                }
-                break :blk update.expected_revision;
-            } else blk: {
-                const Set = struct { expected_revision: []const u8, settings: schema.Settings };
-                storage.shape(Set, params) catch return client.invalid("parameters");
-                const value = std.json.parseFromValueLeaky(Set, allocator, params, .{}) catch return client.invalid("settings");
-                settings = value.settings;
-                break :blk value.expected_revision;
-            };
-            schema.validate(settings) catch return client.invalid("settings");
-            if (!std.mem.eql(u8, expected_revision, self.store.state.value.revision)) return client.failure(interface ++ ".Conflict", .{ .revision = self.store.state.value.revision });
-            const changed = self.store.set(settings) catch |err| switch (err) {
-                error.AmbiguousCommit => return err,
-                error.StateTooLarge => return client.invalid("settings"),
-                else => return client.failure(interface ++ ".PersistenceFailed", struct {}{}),
-            };
-            if (changed) for (&self.clients) |*subscriber| {
-                if (!subscriber.watching) continue;
-                if (subscriber.path != null) {
-                    try subscriber.pathSnapshot(self.store, false);
-                    continue;
-                }
-                // Never queue behind an unsent/partially sent snapshot.
-                if (subscriber.output != null) subscriber.close() else try subscriber.snapshot(self.store);
-            };
-            return client.snapshot(self.store);
-        }
-        if (std.mem.eql(u8, method, "org.varlink.service.GetInfo")) {
-            if (params.object.count() != 0) return client.invalid("parameters");
-            return client.reply(.{ .parameters = .{ .vendor = "Ouro", .product = "ourosettings", .version = "0.1.0", .url = "https://github.com/rockorager", .interfaces = [_][]const u8{ "org.varlink.service", interface } } });
-        }
-        if (std.mem.eql(u8, method, "org.varlink.service.GetInterfaceDescription")) {
-            const Describe = struct { interface: []const u8 };
-            storage.shape(Describe, params) catch return client.invalid("interface");
-            const name = params.object.get("interface").?.string;
-            if (name.len > 255) return client.invalid("interface");
-            const description = if (std.mem.eql(u8, name, interface)) @embedFile("settings_idl") else if (std.mem.eql(u8, name, "org.varlink.service")) @embedFile("service_idl") else return client.failure("org.varlink.service.InterfaceNotFound", .{ .interface = name });
-            return client.reply(.{ .parameters = .{ .description = description } });
-        }
-        return client.failure("org.varlink.service.MethodNotFound", .{ .method = method });
+        if (try client.peer.request(client, self.store, bytes)) try self.publish();
     }
 
     fn loop(self: *Service, idle_ms: i64) !void {
@@ -189,7 +83,9 @@ const Service = struct {
             polls[0] = .{ .fd = self.listener, .events = c.POLLIN, .revents = 0 };
             var count: usize = 0;
             for (&self.clients, 0..) |*client, i| {
-                if (client.fd >= 0 and (!client.watching or client.output != null) and os.now() >= client.deadline) client.close();
+                const active_deadline = !client.peer.listening() or client.output != null;
+                const partial_expired = client.used != 0 and os.now() >= client.request_deadline;
+                if (client.fd >= 0 and (partial_expired or (active_deadline and os.now() >= client.deadline))) client.close();
                 if (client.fd >= 0) count += 1;
                 polls[i + 1] = .{ .fd = client.fd, .events = if (client.output != null) c.POLLOUT else c.POLLIN, .revents = 0 };
             }
@@ -227,12 +123,10 @@ const Service = struct {
                         }
                     }
                 } else if (events & c.POLLIN != 0) {
-                    if (client.watching) {
-                        client.close();
-                        continue;
-                    }
                     const got = c.recv(client.fd, client.input[client.used..].ptr, client.input.len - client.used, 0);
                     if (got > 0) {
+                        if (client.used == 0) client.request_deadline = os.now() + 30_000;
+                        if (client.used == 0 and client.peer.listening()) client.deadline = os.now() + 30_000;
                         client.used += @intCast(got);
                     } else if (got == 0 or (c.__errno_location().* != c.EAGAIN and c.__errno_location().* != c.EINTR)) {
                         client.close();
@@ -240,44 +134,44 @@ const Service = struct {
                     }
                 }
                 if (client.output == null and client.used > 0) {
-                    if (client.watching) {
-                        client.close();
-                        continue;
-                    }
-                    if (std.mem.indexOfScalar(u8, client.input[0..client.used], 0)) |end| {
-                        try self.request(client, client.input[0..end]);
+                    if (std.mem.indexOfScalar(u8, client.input[0..client.used], '\n')) |end| {
+                        self.request(client, client.input[0..end]) catch |err| switch (err) {
+                            error.ReplyTooLarge => client.close(),
+                            else => return err,
+                        };
                         if (client.fd < 0) continue;
                         std.mem.copyForwards(u8, client.input[0..], client.input[end + 1 .. client.used]);
                         client.used -= end + 1;
+                        if (client.output == null) client.deadline = os.now() + 30_000;
                     } else if (client.used == limit) {
-                        try client.invalid("request");
+                        _ = try mcp.rpcError(client, .null, -32600, "Record exceeds 256 KiB");
                         client.closing = true;
                     }
                 }
             }
-            if (polls[0].revents & c.POLLIN != 0) for (0..16) |_| {
-                const fd = c.accept4(self.listener, .{ .__sockaddr__ = null }, null, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
-                if (fd < 0) break;
-                var credentials: c.struct_ucred = undefined;
-                var size: c.socklen_t = @sizeOf(c.struct_ucred);
-                if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_PEERCRED, &credentials, &size) != 0 or size != @sizeOf(c.struct_ucred) or credentials.uid != c.geteuid()) {
-                    const denied = "{\"error\":\"org.varlink.service.PermissionDenied\",\"parameters\":{}}\x00";
-                    _ = c.send(fd, denied.ptr, denied.len, c.MSG_NOSIGNAL);
-                    _ = c.close(fd);
-                    continue;
-                }
-                var accepted = false;
-                for (&self.clients) |*client| if (client.fd < 0) {
-                    const input = a.alloc(u8, limit) catch {
+            {
+                if (polls[0].revents & c.POLLIN != 0) for (0..16) |_| {
+                    const fd = c.accept4(self.listener, .{ .__sockaddr__ = null }, null, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
+                    if (fd < 0) break;
+                    var credentials: c.struct_ucred = undefined;
+                    var size: c.socklen_t = @sizeOf(c.struct_ucred);
+                    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_PEERCRED, &credentials, &size) != 0 or size != @sizeOf(c.struct_ucred) or credentials.uid != c.geteuid()) {
                         _ = c.close(fd);
-                        return error.OutOfMemory;
+                        continue;
+                    }
+                    var accepted = false;
+                    for (&self.clients) |*client| if (client.fd < 0) {
+                        const input = a.alloc(u8, limit) catch {
+                            _ = c.close(fd);
+                            return error.OutOfMemory;
+                        };
+                        client.* = .{ .fd = fd, .input = input, .deadline = os.now() + 30_000 };
+                        accepted = true;
+                        break;
                     };
-                    client.* = .{ .fd = fd, .input = input, .deadline = os.now() + 30_000 };
-                    accepted = true;
-                    break;
+                    if (!accepted) _ = c.close(fd);
                 };
-                if (!accepted) _ = c.close(fd);
-            };
+            }
         }
     }
 };
@@ -290,7 +184,7 @@ const Listener = struct {
     inode: c.struct_stat,
     activated: bool,
 
-    fn init(path: []const u8, environ: std.process.Environ.Map) !Listener {
+    fn init(path: []const u8, inherited: ?c_int) !Listener {
         const dir = try os.directory(std.fs.path.dirname(path) orelse return error.InvalidPath);
         errdefer _ = c.close(dir);
         const name = try os.z(std.fs.path.basename(path));
@@ -304,10 +198,8 @@ const Listener = struct {
         address.sun_family = c.AF_UNIX;
         if (path.len >= address.sun_path.len) return error.SocketPathTooLong;
         @memcpy(@as([*]u8, @ptrCast(&address.sun_path))[0..path.len], path);
-        const fds = environ.get("LISTEN_FDS");
-        const pid = environ.get("LISTEN_PID");
-        const activated = fds != null or pid != null;
-        const fd: c_int = if (activated) 3 else c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
+        const activated = inherited != null;
+        const fd: c_int = inherited orelse c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
         try os.check(fd >= 0);
         errdefer _ = c.close(fd);
         var bound = false;
@@ -315,7 +207,6 @@ const Listener = struct {
             _ = c.unlinkat(dir, name, 0);
         };
         if (activated) {
-            if (fds == null or pid == null or !std.mem.eql(u8, fds.?, "1") or (std.fmt.parseInt(c.pid_t, pid.?, 10) catch return error.InvalidActivation) != c.getpid()) return error.InvalidActivation;
             var actual: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
             var size: c.socklen_t = @sizeOf(c.struct_sockaddr_un);
             var accepting: c_int = 0;
@@ -350,6 +241,19 @@ const Listener = struct {
     }
 };
 
+// Check fd 3 before opening directories/locks so a missing inherited fd cannot
+// accidentally become a newly opened descriptor. Listener.init checks its path,
+// listening state, socket type and ownership before accepting clients.
+fn activation(environ: std.process.Environ.Map) !?c_int {
+    const fds = environ.get("LISTEN_FDS");
+    const pid = environ.get("LISTEN_PID");
+    if (fds == null and pid == null) return null;
+    if (fds == null or pid == null or (std.fmt.parseInt(c.pid_t, pid.?, 10) catch return error.InvalidActivation) != c.getpid()) return error.InvalidActivation;
+    const count = std.fmt.parseInt(usize, fds.?, 10) catch return error.InvalidActivation;
+    if (count != 1 or c.fcntl(3, c.F_GETFD) < 0) return error.InvalidActivation;
+    return 3;
+}
+
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         std.debug.print("ourosettings: {s}\n", .{@errorName(err)});
@@ -369,7 +273,8 @@ fn run(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--help")) return os.writeAll(1, "ourosettings [--socket ABSOLUTE_PATH] [--state ABSOLUTE_PATH] [--idle-ms 1..300000]\n" ++
             "Desired settings only: does not configure or signal Ouro.\n" ++
-            "Socket: $XDG_RUNTIME_DIR/ouro/settings.sock (or validated systemd fd 3).\n" ++
+            "MCP: $XDG_RUNTIME_DIR/ouro/settings.mcp.sock.\n" ++
+            "Accepts one validated systemd listener at fd 3.\n" ++
             "State: $XDG_CONFIG_HOME/ouro/settings.json, fallback $HOME/.config/ouro/settings.json.\n" ++
             "Explicit paths isolate tests; same-UID credentials and private permissions always apply.\n");
         if (i + 1 >= args.len) return error.UnknownOption;
@@ -382,7 +287,7 @@ fn run(init: std.process.Init) !void {
         const runtime = init.minimal.environ.getPosix("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory;
         const root = try os.directory(runtime);
         _ = c.close(root);
-        socket_path = try std.fmt.allocPrint(arena, "{s}/ouro/settings.sock", .{runtime});
+        socket_path = try std.fmt.allocPrint(arena, "{s}/ouro/settings.mcp.sock", .{runtime});
     }
     if (state_path == null) {
         const config = init.minimal.environ.getPosix("XDG_CONFIG_HOME");
@@ -391,7 +296,8 @@ fn run(init: std.process.Init) !void {
     }
     var env = try init.minimal.environ.createMap(a);
     defer env.deinit();
-    var listener = try Listener.init(socket_path.?, env);
+    const inherited = try activation(env);
+    var listener = try Listener.init(socket_path.?, inherited);
     defer listener.deinit();
     var store = try storage.Store.init(state_path.?);
     defer store.deinit();
