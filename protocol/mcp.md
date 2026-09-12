@@ -61,18 +61,28 @@ authoritative; reading must not reinterpret their missing/null behavior.
 Preserve number lexemes in compositor JSON: `1`, `1.0`, and `1e0` differ in
 Ouro's integer validation and must not be normalized into one another.
 
-## Settings mutations
+## Settings tools
 
-Expose `settings.set` and `settings.set_section` through `tools/list` and
-`tools/call`, with JSON Schemas and descriptions explaining full replacement:
+Expose `settings.get`, `settings.set`, and `settings.set_section` through
+`tools/list` and `tools/call`, with JSON Schemas and descriptions:
 
+- `settings.get`: `{}` or omitted arguments reads all current desired settings
+  and their global revision from the same live store as resources. It does not
+  persist, change the revision, or notify subscribers. This supports tools-only
+  clients such as ouromcp without resource forwarding. It accepts no selection
+  or other arguments; nonempty objects produce `InvalidParameters`, and
+  non-object arguments produce JSON-RPC error `-32602`.
 - `settings.set`: `{ expected_revision, settings }` replaces all settings.
 - `settings.set_section`: `{ expected_revision, section, value? }` replaces one
   complete section. Omitted/null `preferred_output` clears it; other sections
   reject omitted/null values, as before. This is not a merge operation.
 
 Success uses authoritative `structuredContent: { revision, settings }` plus
-the identical serialized JSON in a text content block. The independent 128 KiB
+the identical serialized JSON in a text content block for all three tools.
+The read revision is the global `expected_revision` token for either write tool;
+it can become stale after any intervening write. Resource reads retain their
+separate `{ revision, exists, value }` format and JSON-pointer behavior.
+The independent 128 KiB
 storage/load limit remains unchanged. Even if every stored byte requires JSON
 escaping in the text copy, two copies plus envelope overhead remain well below
 the 4 MiB wire limit, so accepted storage always has a representable response.

@@ -233,6 +233,14 @@ pub const Peer = struct {
             const name = get(params, "name");
             const args = get(params, "arguments");
             if (!keys(params, &.{ "_meta", "name", "arguments" }) or name != .string or (params.object.contains("arguments") and args != .object)) return rpcError(client, id, -32602, "Invalid params");
+            if (text(name, "settings.get")) {
+                if (args == .object and !keys(args, &.{})) {
+                    try toolResult(client, id, .{ .@"error" = .{ .code = "InvalidParameters", .message = "settings.get accepts no arguments" } }, true);
+                } else {
+                    try toolResult(client, id, .{ .revision = store.state.value.revision, .settings = store.state.value.settings }, false);
+                }
+                return false;
+            }
             const section = text(name, "settings.set_section");
             if (!section and !text(name, "settings.set")) return rpcError(client, id, -32602, "Unknown tool");
             const changed = replaceSettings(store, allocator, args, section) catch |err| {

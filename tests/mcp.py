@@ -83,6 +83,7 @@ OUTPUT = {"type": "object", "oneOf": [obj({"revision": STRING, "settings": SETTI
     obj({"error": {**obj({"code": {"enum": ["Conflict", "InvalidParameters", "PersistenceFailed"]},
                          "message": STRING, "revision": STRING}, ["code", "message"]),
                     "if": {"properties": {"code": {"const": "Conflict"}}}, "then": {"required": ["revision"]}}}, ["error"])]}
+GET_INPUT = {"$schema": "https://json-schema.org/draft/2020-12/schema", **obj({}, [])}
 FULL_INPUT = {"$schema": "https://json-schema.org/draft/2020-12/schema",
               **obj({"expected_revision": STRING, "settings": SETTINGS}, ["expected_revision", "settings"])}
 SECTION_INPUT = {"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -143,7 +144,7 @@ class MCPTests(support.DaemonFixture):
             "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "ourosettings", "version": "0.1.0"}}}})
         listed = self.rpc(c, "tools/list")["result"]
         self.assertEqual({k: listed[k] for k in CACHE}, CACHE)
-        self.assertEqual(len(listed["tools"]), 2)
+        self.assertEqual(len(listed["tools"]), 3)
         exported = subprocess.check_output([support.EXE, "--export-mcp-descriptor"], env={}, timeout=3)
         self.assertTrue(exported.endswith(b"\n"))
         self.assertEqual(exported.count(b"\n"), 1)
@@ -152,10 +153,11 @@ class MCPTests(support.DaemonFixture):
             "endpoint": {"runtime_path": "ouro/settings.mcp.sock"},
             "tools": listed["tools"],
         })
-        for tool, name, shape in zip(listed["tools"], ("settings.set", "settings.set_section"), (FULL_INPUT, SECTION_INPUT)):
+        for tool, name, shape in zip(listed["tools"], ("settings.get", "settings.set", "settings.set_section"),
+                                     (GET_INPUT, FULL_INPUT, SECTION_INPUT)):
             self.assertEqual(set(tool), {"name", "description", "inputSchema", "outputSchema"})
             self.assertEqual(tool["name"], name)
-            self.assertIn("Replace", tool["description"])
+            self.assertIn("Read" if name == "settings.get" else "Replace", tool["description"])
             self.assertEqual(tool["inputSchema"], shape)
             self.assertEqual(tool["outputSchema"], OUTPUT)
             if OFFICIAL is not None:
@@ -167,6 +169,82 @@ class MCPTests(support.DaemonFixture):
         self.assertEqual(self.rpc(c, "resources/templates/list")["result"], {**CACHE, "resourceTemplates": [{
             "uriTemplate": ROOT + "{+pointer}", "name": "settings-pointer", "mimeType": "application/json",
             "description": "A percent-encoded RFC 6901 pointer, empty for all settings. Missing selections have exists false; stored null has exists true."}]})
+
+    def test_get_full_settings_and_global_revision(self):
+        process = self.spawn(); c = self.client()
+        initial = self.tool(c, {}, "settings.get")["structuredContent"]
+        defaults = {"appearance": {"color_scheme": "default"}, "compositor": {},
+                    "wallpaper": {"default": {"fit": "fill", "fallback": {"r": 0, "g": 0, "b": 0}}, "outputs": []}}
+        self.assertEqual(initial["settings"], defaults)
+        self.assertEqual(initial, self.get())
+        settings = {
+            "appearance": {"color_scheme": "dark", "accent": {"r": .125, "g": .5, "b": .75}},
+            "compositor": {"general": {"array": [None, False, 0, "雪", [], {}], "a/b": {"~": "value"}},
+                           "bindings": {"Super+q": ["call", "unix:/example.sock", "quit", {}]},
+                           "input_rules": None, "output_rules": {"internal": {"priority": -3}}},
+            "preferred_output": {"name": "DP-*", "connector_id": 7},
+            "wallpaper": {"default": {"image": "/images/snow.png", "fit": "fit", "fallback": {"r": .25, "g": .5, "b": 1}},
+                          "outputs": [{"match": {"name": "eDP-1"},
+                                       "wallpaper": {"fit": "tile", "fallback": {"r": 1, "g": 0, "b": .5}}}]}}
+        written = self.tool(c, {"expected_revision": initial["revision"], "settings": settings}, "settings.set")["structuredContent"]
+        self.assertNotEqual(written["revision"], initial["revision"])
+        expected = {"revision": written["revision"], "settings": settings}
+        self.check_tool(self.tool(c, {}, "settings.get"), expected)
+        self.check_tool(self.rpc(c, "tools/call", {"name": "settings.get"})["result"], expected)
+        self.assertEqual(self.read(c), {"revision": expected["revision"], "exists": True, "value": settings})
+        self.assertEqual(self.read(c, "/appearance/color_scheme"),
+                         {"revision": expected["revision"], "exists": True, "value": "dark"})
+        # A write to an unrelated section advances the same global token.
+        current = self.tool(c, {"expected_revision": expected["revision"], "section": "preferred_output"})["structuredContent"]
+        self.assertNotEqual(current["revision"], expected["revision"])
+        del settings["preferred_output"]
+        expected = {"revision": current["revision"], "settings": settings}
+        self.check_tool(self.tool(c, {}, "settings.get"), expected)
+        self.assertEqual(self.read(c, "/appearance/color_scheme"),
+                         {"revision": current["revision"], "exists": True, "value": "dark"})
+        c.close(); process.terminate(); process.communicate(timeout=5)
+        self.spawn(); c = self.client()
+        self.check_tool(self.tool(c, {}, "settings.get"), expected)
+
+    def test_get_is_read_only_and_uses_live_store(self):
+        self.spawn(); c = self.client(); subscriber = self.client()
+        self.listen(subscriber, "all", [""])
+        expected = self.get()
+        before = self.state.read_bytes()
+        metadata = self.state.stat()
+        for fault in ("write", "file-fsync", "rename", "directory-fsync"):
+            self.fault.write_text(fault)
+            self.check_tool(self.tool(c, {}, "settings.get"), expected)
+        self.fault.unlink()
+        after = self.state.stat()
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+                         (metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns))
+        self.assertEqual(self.get(), expected)
+        self.quiet(subscriber)
+        # Reads use the authoritative live snapshot, not a separate disk loader.
+        self.state.write_text("externally corrupted")
+        self.check_tool(self.tool(c, {}, "settings.get"), expected)
+        self.assertEqual(self.get(), expected)
+        self.assertEqual(self.state.read_text(), "externally corrupted")
+        self.quiet(subscriber)
+
+    def test_get_rejects_arguments_without_mutation(self):
+        self.spawn(); c = self.client(); self.listen(c, "all", [""])
+        expected = self.get(); before = self.state.read_bytes(); metadata = self.state.stat()
+        for args in ({"pointer": "/appearance"}, {"section": "compositor"}, {"uri": ROOT},
+                     {"expected_revision": expected["revision"]}, {"settings": expected["settings"]}, {"unknown": None}):
+            self.check_tool(self.tool(c, args, "settings.get"),
+                            {"error": {"code": "InvalidParameters", "message": "settings.get accepts no arguments"}}, True)
+        for args in (None, [], "", 0, False):
+            self.assertEqual(self.rpc(c, "tools/call", {"name": "settings.get", "arguments": args})["error"]["code"], -32602)
+        self.check_tool(self.tool(c, {}, "settings.get"), expected)
+        self.assertEqual(self.get(), expected)
+        self.assertEqual(self.state.read_bytes(), before)
+        after = self.state.stat()
+        self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+                         (metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns))
+        self.quiet(c)
 
     def test_multiple_client_writes_noops_and_filtered_notifications(self):
         self.spawn(); c = self.client()
@@ -246,6 +324,9 @@ class MCPTests(support.DaemonFixture):
             self.assertEqual(c.receive(), notification("raw", "resources/updated", uri=ROOT + "/compositor/general/n"))
             content = self.rpc(c, "resources/read", {"uri": ROOT + "/compositor/general/n"})["result"]["contents"][0]["text"]
             self.assertIn('"value":' + token + '}', content)
+            result = self.tool(c, {}, "settings.get")
+            self.check_tool(result, self.get())
+            self.assertIn('"n":' + token + '}', result["content"][0]["text"])
         for general, exists in (({"n": None}, True), ({}, False)):
             current = self.section(self.get(), "compositor", {"general": general})["structuredContent"]
             self.assertEqual(c.receive(), notification("raw", "resources/updated", uri=ROOT + "/compositor/general/n"))
@@ -381,6 +462,9 @@ class MCPTests(support.DaemonFixture):
         self.assertEqual(c.receive(), notification("small", "resources/updated", uri=ROOT + "/compositor/general/n"))
         self.assertEqual(self.read(c, "/compositor/general/n"), {"revision": current["revision"], "exists": True, "value": 19})
         self.assertEqual(self.read(writer)["value"], current["settings"])
+        self.check_tool(self.tool(writer, {}, "settings.get"), current)
+        self.assertGreater(writer.last_record_size, 256 * 1024)
+        self.assertLess(writer.last_record_size, 4 * 1024 * 1024)
 
     def test_existing_large_state_loads_and_can_be_reduced(self):
         process = self.spawn()

@@ -77,6 +77,12 @@ unsupported present values. This is not legacy version negotiation.
   for example `ouro://settings/compositor`. It returns `application/json` text
   containing `{revision, exists, value}`. Missing selections are readable with
   `exists: false, value: null`; stored null has `exists: true`.
+* `tools/call` exposes read-only `settings.get` (`{}` or omitted arguments),
+  returning all current desired settings and their global revision. Use it to
+  read through tools-only clients such as ouromcp before preparing a replacement.
+  It reads the same live store as resources, without writing or notifying.
+  Extra arguments return `InvalidParameters`; non-object arguments are malformed
+  RPC requests. Pointer selections remain available through `resources/read`.
 * `tools/call` exposes `settings.set` (`{expected_revision, settings}`) and
   `settings.set_section` (`{expected_revision, section, value?}`). Both replace,
   never merge. A section is `appearance`, `compositor`, `wallpaper`, or
@@ -84,7 +90,7 @@ unsupported present values. This is not legacy version negotiation.
   inside the replacement are cleared. Only `preferred_output` allows omitted
   or null `value`, clearing it; `{}` instead stores an all-output selector.
   Discover exact JSON Schema 2020-12 inputs and outputs via `tools/list`.
-* Success returns full `{revision, settings}` in `structuredContent`, with the
+* Tool success returns full `{revision, settings}` in `structuredContent`, with the
   identical serialized JSON duplicated in text. The separate 128 KiB stored
   state cap guarantees this duplicated result fits within the 4 MiB wire cap.
 * Execution failures return `isError: true` and structured
@@ -107,6 +113,8 @@ Ctrl-C. Using the isolated path above:
 ```sh
 python3 examples/mcp.py "$testdir/settings.mcp.sock" server/discover
 python3 examples/mcp.py "$testdir/settings.mcp.sock" tools/list
+python3 examples/mcp.py "$testdir/settings.mcp.sock" tools/call \
+  '{"name":"settings.get","arguments":{}}'
 python3 examples/mcp.py "$testdir/settings.mcp.sock" resources/read \
   '{"uri":"ouro://settings"}'
 python3 examples/mcp.py "$testdir/settings.mcp.sock" subscriptions/listen \
@@ -319,6 +327,8 @@ writers and no-ops, null/default/omission/argv/raw-number preservation, schema
 bounds, corrupt/external state retention, locks/symlinks/permissions, client/state
 limits, defaults, obsolete flag rejection, and activation/idle/reactivation.
 `tests/mcp.py` covers independently authored discovered schemas and envelopes,
+full `settings.get` reads, global revision consistency, read-only behavior,
+invalid read arguments, descriptor parity,
 structured errors, URI escaping and all JSON types, selected-value filtering,
 same-connection listen/read/call/cancel, multiple IDs, fragmented/coalesced
 records, backpressure/final invalidation, near-limit successful responses,

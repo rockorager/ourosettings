@@ -85,6 +85,8 @@ pub fn tools(a: A) !V {
     output.object.getPtr("oneOf").?.array.items[0] = try shape(struct { revision: []const u8, settings: schema.Settings }, a);
     var full = try shape(struct { expected_revision: []const u8, settings: schema.Settings }, a);
     try put(a, &full, "$schema", string("https://json-schema.org/draft/2020-12/schema"));
+    var read = try shape(struct {}, a);
+    try put(a, &read, "$schema", string("https://json-schema.org/draft/2020-12/schema"));
     var section = try json(a,
         \\{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["expected_revision","section"],"properties":{"expected_revision":{"type":"string"},"section":{"enum":["appearance","compositor","preferred_output","wallpaper"]},"value":{}},"oneOf":[]}
     );
@@ -98,6 +100,7 @@ pub fn tools(a: A) !V {
     }
     var list: V = .{ .array = std.array_list.Managed(V).init(a) };
     inline for (.{
+        .{ "settings.get", "Read all current desired settings and their global revision before preparing a replacement. Accepts no arguments and does not modify settings. The revision can be used as expected_revision for either settings write tool.", read },
         .{ "settings.set", "Replace all desired settings using the current global expected_revision. Persistence does not confirm compositor application. On Conflict, read and reconsider; never blindly replay a lost response.", full },
         .{ "settings.set_section", "Replace one complete section, not a merge patch. Omitted fields in that section are cleared. Only preferred_output accepts omitted/null value. Unrelated sections are retained; expected_revision is global. On Conflict, read and reconsider.", section },
     }) |entry| {
